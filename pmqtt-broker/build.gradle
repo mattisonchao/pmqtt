@@ -1,0 +1,5 @@
+dependencies {
+    compileOnly 'org.apache.pulsar:pulsar-broker:3.0.2'
+    implementation "io.netty:netty-codec-mqtt:4.1.86.Final"
+    implementation project(':pmqtt-common')
+}
