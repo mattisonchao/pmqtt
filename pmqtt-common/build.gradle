@@ -1,4 +1,0 @@
-dependencies {
-    compileOnly 'io.netty:netty-common:4.1.104.Final'
-
-}

@@ -1,4 +1,4 @@
-package io.github.pmqtt.common.futures;
+package io.github.pmqtt.broker.utils.future;
 
 import io.netty.util.concurrent.Future;
 import java.util.Objects;

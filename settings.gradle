@@ -1,7 +1,4 @@
 rootProject.name = 'pmqtt'
 
-include("pmqtt-common")
 include("pmqtt-broker")
-include("pmqtt-delegator")
 include("pmqtt-integration")
-include("pmqtt-proxies:pmqtt-pulsar-proxy-plugin")
