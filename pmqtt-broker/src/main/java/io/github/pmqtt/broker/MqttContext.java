@@ -1,6 +1,8 @@
 package io.github.pmqtt.broker;
 
 import io.github.pmqtt.broker.connection.Connection;
+import io.github.pmqtt.broker.converter.TopicNameConverter;
+import io.github.pmqtt.broker.converter.TopicNameConverterFactory;
 import io.github.pmqtt.broker.options.MqttOptions;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
@@ -22,10 +24,12 @@ public final class MqttContext extends ChannelInitializer<SocketChannel> {
 
   @Getter private final PulsarService pulsarService;
   @Getter private final MqttOptions mqttOptions;
+  @Getter private final TopicNameConverter converter;
 
   public MqttContext(@NotNull PulsarService pulsarService, @NotNull MqttOptions mqttOptions) {
     this.pulsarService = pulsarService;
     this.mqttOptions = mqttOptions;
+    this.converter = TopicNameConverterFactory.create("");
   }
 
   @Override
