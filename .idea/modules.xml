@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<project version="4">
-  <component name="ProjectModuleManager">
-    <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/modules/pmqtt-broker/pmqtt.pmqtt-broker.main.iml" filepath="$PROJECT_DIR$/.idea/modules/pmqtt-broker/pmqtt.pmqtt-broker.main.iml" />
-      <module fileurl="file://$PROJECT_DIR$/.idea/modules/pmqtt-common/pmqtt.pmqtt-common.main.iml" filepath="$PROJECT_DIR$/.idea/modules/pmqtt-common/pmqtt.pmqtt-common.main.iml" />
-    </modules>
-  </component>
-</project>
