@@ -64,6 +64,7 @@ import org.apache.bookkeeper.mledger.Entry;
 import org.apache.pulsar.broker.authentication.AuthenticationDataCommand;
 import org.apache.pulsar.broker.authentication.AuthenticationDataSource;
 import org.apache.pulsar.broker.service.BrokerService;
+import org.apache.pulsar.broker.service.BrokerServiceException;
 import org.apache.pulsar.broker.service.Consumer;
 import org.apache.pulsar.broker.service.EntryBatchIndexesAcks;
 import org.apache.pulsar.broker.service.EntryBatchSizes;
@@ -83,6 +84,7 @@ import org.apache.pulsar.common.compression.CompressionCodecProvider;
 import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.protocol.schema.SchemaVersion;
 import org.apache.pulsar.common.schema.SchemaInfo;
+import org.apache.pulsar.common.util.FutureUtil;
 
 @ToString
 @Slf4j
@@ -302,8 +304,8 @@ public class Connection extends ChannelInboundHandlerAdapter
     this.clientId = identifier;
     this.assignedId = assignedIdentifier;
     this.version = MqttVersion.fromProtocolNameAndLevel(var.name(), (byte) var.version());
-    // We don't support mqtt 5 yet.
-    if (connectMessage.variableHeader().version() > MqttVersion.MQTT_3_1_1.protocolLevel()) {
+    // check protocol version
+    if (connectMessage.variableHeader().version() > MqttVersion.MQTT_5.protocolLevel()) {
       // The Server MUST respond to the CONNECT Packet with a CONNACK return code 0x01
       // (unacceptable protocol level) and then disconnect the Client if the Protocol
       // Level is not supported by the Server [MQTT-3.1.2-2].
@@ -326,8 +328,8 @@ public class Connection extends ChannelInboundHandlerAdapter
     this.keepAliveTimeSeconds = var.keepAliveTimeSeconds();
     this.connectTime = System.currentTimeMillis();
     // remove the idle state handler for timeout on CONNECT
-    ctx.pipeline().remove("idle");
-    ctx.pipeline().remove("timeoutOnConnect");
+    ctx.pipeline().remove(MqttContext.CONNECT_IDLE_NAME);
+    ctx.pipeline().remove(MqttContext.CONNECT_TIMEOUT_NAME);
 
     // keep alive == 0 means NO keep alive, no timeout to handle
     if (connectMessage.variableHeader().keepAliveTimeSeconds() != 0) {
@@ -471,11 +473,15 @@ public class Connection extends ChannelInboundHandlerAdapter
                         .addProducer(producer, new CompletableFuture<>())
                         .thenApply(topicEpoch -> producer);
                   })
-              .get(30, TimeUnit.SECONDS); // block here for easy implement
-      // todo async improvement
+              .get(30, TimeUnit.SECONDS); // back pressure here
       publishAsync(message);
-    } catch (InterruptedException | ExecutionException | TimeoutException e) {
-      // todo handle exception
+    } catch (InterruptedException | ExecutionException | TimeoutException ex) {
+      final Throwable rc = FutureUtil.unwrapCompletionException(ex);
+      log.error("Received an exception.", ex);
+      if (rc instanceof BrokerServiceException.ServiceUnitNotReadyException) {
+        // todo redirect
+        return;
+      }
     }
   }
 

@@ -1,0 +1,14 @@
+dependencies {
+    testImplementation "org.apache.pulsar:pulsar-broker:${getProperty("pulsar.version")}"
+    testImplementation "com.hivemq:hivemq-mqtt-client:${getProperty("hivemq.version")}"
+    testImplementation 'org.slf4j:slf4j-simple:2.0.12'
+}
+
+test {
+    doFirst {
+        jvmArgs += [
+                '--add-opens', 'java.base/java.io=ALL-UNNAMED',
+                '--add-opens', 'java.base/jdk.internal.platform=ALL-UNNAMED',
+        ]
+    }
+}

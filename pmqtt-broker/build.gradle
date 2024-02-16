@@ -1,4 +1,10 @@
+plugins {
+    id "io.github.lhotari.gradle-nar-plugin" version "0.5.1"
+}
+
+version = parent.version
+
 dependencies {
-    compileOnly 'org.apache.pulsar:pulsar-broker:3.0.2'
+    compileOnly "org.apache.pulsar:pulsar-broker:${getProperty("pulsar.version")}"
     implementation "io.netty:netty-codec-mqtt:4.1.86.Final"
 }
