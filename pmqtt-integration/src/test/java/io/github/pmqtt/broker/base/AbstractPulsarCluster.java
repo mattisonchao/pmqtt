@@ -22,9 +22,8 @@ public abstract class AbstractPulsarCluster implements AutoCloseable {
   protected void start() {
     ensemble = new LocalBookkeeperEnsemble(3, 0, () -> 0);
     ensemble.start();
-    loadDefaultConfiguration(broker1Conf);
-    loadDefaultConfiguration(broker2Conf);
-
+    loadBrokerConfiguration(broker1Conf);
+    loadBrokerConfiguration(broker2Conf);
     // deep copy
     broker1 = new PulsarService(broker1Conf);
     broker2 = new PulsarService(broker2Conf);
@@ -32,7 +31,7 @@ public abstract class AbstractPulsarCluster implements AutoCloseable {
     broker2.start();
   }
 
-  private void loadDefaultConfiguration(ServiceConfiguration brokerConf) {
+  protected void loadBrokerConfiguration(ServiceConfiguration brokerConf) {
     final String projectRootPath =
         System.getProperty("user.dir").replace(File.separator + "pmqtt-integration", "");
     final String narDir =

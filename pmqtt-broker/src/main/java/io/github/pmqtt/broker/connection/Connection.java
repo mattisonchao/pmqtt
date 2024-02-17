@@ -42,6 +42,7 @@ import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.Promise;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -63,6 +64,8 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.mledger.Entry;
 import org.apache.pulsar.broker.authentication.AuthenticationDataCommand;
 import org.apache.pulsar.broker.authentication.AuthenticationDataSource;
+import org.apache.pulsar.broker.authentication.AuthenticationProvider;
+import org.apache.pulsar.broker.authentication.AuthenticationService;
 import org.apache.pulsar.broker.service.BrokerService;
 import org.apache.pulsar.broker.service.BrokerServiceException;
 import org.apache.pulsar.broker.service.Consumer;
@@ -290,6 +293,13 @@ public class Connection extends ChannelInboundHandlerAdapter
   }
 
   // ------- mqtt message handlers
+
+  private static final String KEEP_ALIVE_HANDLER_NAME = "keepAliveHandler";
+  private static final String MQTT_ENCODER_NAME = "mqttEncoder";
+  private static final String AUTH_METHOD_USERNAME_PREFIX = "method:";
+
+  private String subject;
+
   private void handleConnect(@Nonnull MqttConnectMessage connectMessage) {
     final MqttConnectVariableHeader var = connectMessage.variableHeader();
     final MqttConnectPayload payload = connectMessage.payload();
@@ -317,7 +327,7 @@ public class Connection extends ChannelInboundHandlerAdapter
     // In cases where the ClientID is assigned by the Server, return the assigned ClientID.
     // This also lifts the restriction that Server assigned ClientIDs can only be used with Clean
     // Session=1.
-    if (cleanSession && assignedId) {
+    if (assignedId && !cleanSession) {
       final MqttConnectReturnCode code =
           version.protocolLevel() >= MqttVersion.MQTT_5.protocolLevel()
               ? CONNECTION_REFUSED_CLIENT_IDENTIFIER_NOT_VALID
@@ -335,11 +345,15 @@ public class Connection extends ChannelInboundHandlerAdapter
     if (connectMessage.variableHeader().keepAliveTimeSeconds() != 0) {
       final var keepAliveTimeout =
           (int) Math.ceil(connectMessage.variableHeader().keepAliveTimeSeconds() * 1.5D);
-      ctx.pipeline().addBefore("mqttEncoder", "idle", new IdleStateHandler(keepAliveTimeout, 0, 0));
       ctx.pipeline()
           .addBefore(
-              "mqttEncoder",
-              "keepAliveHandler",
+              MQTT_ENCODER_NAME,
+              MqttContext.CONNECT_IDLE_NAME,
+              new IdleStateHandler(keepAliveTimeout, 0, 0));
+      ctx.pipeline()
+          .addBefore(
+              MQTT_ENCODER_NAME,
+              KEEP_ALIVE_HANDLER_NAME,
               new ChannelDuplexHandler() {
                 @Override
                 public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
@@ -358,7 +372,18 @@ public class Connection extends ChannelInboundHandlerAdapter
     final MqttConnAckMessage message =
         MqttMessageBuilders.connAck()
             .returnCode(CONNECTION_ACCEPTED)
-            .properties(var.properties())
+            .properties(
+                properties -> {
+                  if (assignedIdentifier) {
+                    properties.assignedClientId(clientId);
+                  }
+                  properties
+                      .maximumQos((byte) MqttQoS.AT_LEAST_ONCE.value())
+                      .wildcardSubscriptionAvailable(false)
+                      .sharedSubscriptionAvailable(false)
+                      .retainAvailable(false)
+                      .subscriptionIdentifiersAvailable(false);
+                })
             .sessionPresent(
                 !cleanSession) // todo session present, it should be subscription in pulsar
             .build();
@@ -370,14 +395,33 @@ public class Connection extends ChannelInboundHandlerAdapter
           CONNECTION_REFUSED_UNSUPPORTED_PROTOCOL_VERSION, MqttProperties.NO_PROPERTIES);
       return;
     }
-    wrap(ctx.writeAndFlush(message))
+
+    this.willMessage = connectMessage.payload().willMessageInBytes();
+    this.willTopic = connectMessage.payload().willTopic();
+    this.willProperties = connectMessage.payload().willProperties();
+    this.willQos = connectMessage.variableHeader().willQos();
+    this.willFlag = connectMessage.variableHeader().isWillFlag();
+
+    final CompletableFuture<String> authFuture;
+    if (mqttContext.getMqttOptions().authenticationEnabled()) {
+      authFuture = doAuthenticate(connectMessage);
+    } else {
+      authFuture = CompletableFuture.completedFuture(null);
+    }
+    authFuture
+        .thenCompose(
+            subject -> {
+              this.subject = subject;
+              return wrap(ctx.writeAndFlush(message));
+            })
         .thenAccept(
-            __ ->
-                log.info(
-                    "Accepted the connection. client_id={} client_address={}",
-                    clientId,
-                    clientAddress()))
-        .exceptionally(
+            __ -> {
+              log.info(
+                  "Accepted the connection. client_id={} client_address={}",
+                  clientId,
+                  clientAddress());
+            })
+        .exceptionallyCompose(
             ex -> {
               log.error(
                   "Receive an error while accepting connection.  connection={}",
@@ -386,6 +430,35 @@ public class Connection extends ChannelInboundHandlerAdapter
               closeAsync();
               return null;
             });
+  }
+
+  private @NotNull CompletableFuture<String> doAuthenticate(
+      @NotNull MqttConnectMessage connectMessage) {
+    // todo adding integration test
+    final AuthenticationService authenticationService =
+        mqttContext.getPulsarService().getBrokerService().getAuthenticationService();
+    final boolean hasUserName = connectMessage.variableHeader().hasUserName();
+    final String userName = connectMessage.payload().userName();
+    final boolean hasAuthMethod = hasUserName && userName.startsWith(AUTH_METHOD_USERNAME_PREFIX);
+    final String authMethod = userName.replace(AUTH_METHOD_USERNAME_PREFIX, "");
+    final boolean hasPassword = connectMessage.variableHeader().hasPassword();
+    final byte[] ps = connectMessage.payload().passwordInBytes();
+    final AuthenticationDataSource authenticationDataSource;
+    if (!hasAuthMethod) { // simple username and password
+      // only username here
+      authenticationDataSource =
+          hasPassword
+              ? new AuthenticationDataCommand(
+                  userName + ":" + new String(ps, StandardCharsets.UTF_8))
+              : new AuthenticationDataCommand(userName);
+
+    } else {
+      final String source = hasPassword ? new String(ps, StandardCharsets.UTF_8) : null;
+      authenticationDataSource = new AuthenticationDataCommand(source);
+    }
+    final AuthenticationProvider provider =
+        authenticationService.getAuthenticationProvider(authMethod);
+    return provider.authenticateAsync(authenticationDataSource);
   }
 
   private void connectRejectAsync(
@@ -574,6 +647,14 @@ public class Connection extends ChannelInboundHandlerAdapter
   private MqttVersion version;
   private int keepAliveTimeSeconds;
 
+  // ------ mqtt will message  todo support internal client send will message
+  private byte[] willMessage;
+  private String willTopic;
+  private MqttProperties willProperties;
+  private int willQos;
+  private boolean willRetained;
+  private boolean willFlag;
+
   // ------ lifecycle
   private long connectTime;
   private volatile int status = STATUS_INIT;
@@ -585,11 +666,21 @@ public class Connection extends ChannelInboundHandlerAdapter
   private static final int STATUS_CLOSED = 3;
 
   private void closeAsync() {
+    // DCL start
+    if (STATUS_UPDATER.get(this) == STATUS_CLOSED) {
+      return;
+    }
+    synchronized (this) {
+      if (STATUS_UPDATER.get(this) == STATUS_CLOSED) {
+        return;
+      }
+      STATUS_UPDATER.set(this, STATUS_CLOSED);
+    }
+    // DCL end
     log.info("Closing the connection. client_id={} client_address={}", clientId, clientAddress());
     wrap(ctx.close())
         .thenAccept(
             __ -> {
-              STATUS_UPDATER.set(this, STATUS_CLOSED);
               log.info(
                   "Closed the connection. client_id={} client_address={}",
                   clientId,
