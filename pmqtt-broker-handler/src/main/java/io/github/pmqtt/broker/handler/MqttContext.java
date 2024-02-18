@@ -1,9 +1,9 @@
-package io.github.pmqtt.broker;
+package io.github.pmqtt.broker.handler;
 
-import io.github.pmqtt.broker.connection.Connection;
-import io.github.pmqtt.broker.converter.TopicNameConverter;
-import io.github.pmqtt.broker.converter.TopicNameConverterFactory;
-import io.github.pmqtt.broker.options.MqttOptions;
+import io.github.pmqtt.broker.handler.connection.Connection;
+import io.github.pmqtt.broker.handler.converter.TopicNameConverter;
+import io.github.pmqtt.broker.handler.converter.TopicNameConverterFactory;
+import io.github.pmqtt.broker.handler.options.MqttOptions;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInitializer;
@@ -26,10 +26,15 @@ public final class MqttContext extends ChannelInitializer<SocketChannel> {
   @Getter private final MqttOptions mqttOptions;
   @Getter private final TopicNameConverter converter;
 
-  public MqttContext(@NotNull PulsarService pulsarService, @NotNull MqttOptions mqttOptions) {
+  public MqttContext(@NotNull PulsarService pulsarService, @NotNull MqttOptions mqttOptions)
+      throws ClassNotFoundException {
     this.pulsarService = pulsarService;
     this.mqttOptions = mqttOptions;
-    this.converter = TopicNameConverterFactory.create("");
+    this.converter =
+        TopicNameConverterFactory.create(
+            mqttOptions.mqttTopicNameConverter(),
+            mqttOptions.defaultTenant(),
+            mqttOptions.defaultNamespace());
   }
 
   @Override

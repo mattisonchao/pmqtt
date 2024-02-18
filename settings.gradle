@@ -1,4 +1,4 @@
 rootProject.name = 'pmqtt'
 
-include("pmqtt-broker")
+include("pmqtt-broker-handler")
 include("pmqtt-integration")

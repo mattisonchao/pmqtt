@@ -1,0 +1,3 @@
+name: mqtt
+description: MQTT Protocol Handler
+handlerClass: io.github.pmqtt.broker.handler.MqttProtocolHandler

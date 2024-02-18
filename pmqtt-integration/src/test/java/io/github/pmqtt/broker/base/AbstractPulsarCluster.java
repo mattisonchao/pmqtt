@@ -37,7 +37,7 @@ public abstract class AbstractPulsarCluster implements AutoCloseable {
     final String narDir =
         projectRootPath
             + File.separator
-            + "pmqtt-broker"
+            + "pmqtt-broker-handler"
             + File.separator
             + "build"
             + File.separator

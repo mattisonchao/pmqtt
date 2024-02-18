@@ -1,10 +1,11 @@
-package io.github.pmqtt.broker.connection;
+package io.github.pmqtt.broker.handler.connection;
 
-import static io.github.pmqtt.broker.utils.future.CompletableFutures.wrap;
+import static io.github.pmqtt.broker.handler.utils.future.CompletableFutures.wrap;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_ACCEPTED;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_CLIENT_IDENTIFIER_NOT_VALID;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_IDENTIFIER_REJECTED;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_QOS_NOT_SUPPORTED;
+import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_SERVER_MOVED;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_TOPIC_NAME_INVALID;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_UNACCEPTABLE_PROTOCOL_VERSION;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_UNSPECIFIED_ERROR;
@@ -12,7 +13,7 @@ import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUS
 
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
-import io.github.pmqtt.broker.MqttContext;
+import io.github.pmqtt.broker.handler.MqttContext;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -236,7 +237,7 @@ public class Connection extends ChannelInboundHandlerAdapter
 
   @Override
   public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-    closeAsync();
+    closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
     super.channelInactive(ctx);
   }
 
@@ -363,7 +364,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                           "Prepare close the connection by idle. client_id={} client_address={}",
                           clientId,
                           clientAddress());
-                      closeAsync();
+                      closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
                     }
                   }
                 }
@@ -427,7 +428,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                   "Receive an error while accepting connection.  connection={}",
                   this,
                   Throwables.getRootCause(ex));
-              closeAsync();
+              closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
               return null;
             });
   }
@@ -509,7 +510,6 @@ public class Connection extends ChannelInboundHandlerAdapter
     final var mqttTopicName = var.topicName();
     final var pulsarTopicName = mqttContext.getConverter().convert(mqttTopicName);
     if (producer != null) {
-      // in some cases the client can publish message with different topic
       if (!Objects.equals(pulsarTopicName.toString(), producer.getTopic().getName())) {
         final MqttConnectReturnCode code =
             version.protocolLevel() >= MqttVersion.MQTT_5.protocolLevel()
@@ -550,11 +550,20 @@ public class Connection extends ChannelInboundHandlerAdapter
       publishAsync(message);
     } catch (InterruptedException | ExecutionException | TimeoutException ex) {
       final Throwable rc = FutureUtil.unwrapCompletionException(ex);
-      log.error("Received an exception.", ex);
       if (rc instanceof BrokerServiceException.ServiceUnitNotReadyException) {
-        // todo redirect
-        return;
+        if (version.protocolLevel() < MqttVersion.MQTT_5.protocolLevel()) {
+          log.warn(
+              "The topic is not owned by the current broker. mqtt_topic_name={}  pulsar_topic_name={}",
+              mqttTopicName,
+              pulsarTopicName);
+          closeAsync(CONNECTION_REFUSED_SERVER_MOVED.byteValue());
+          return;
+        } else {
+          // send disconnect to client
+          System.out.println(1);
+        }
       }
+      log.error("Received an exception.", ex);
     }
   }
 
@@ -583,7 +592,10 @@ public class Connection extends ChannelInboundHandlerAdapter
     final var buf =
         Commands.serializeMetadataAndPayload(Commands.ChecksumType.Crc32c, metadata, payload);
     payload.release();
-    inflightPublishPackages.add(packetId);
+    // only send ack when qos greater than 1
+    if (publishMessage.fixedHeader().qosLevel().value() >= MqttQoS.AT_LEAST_ONCE.value()) {
+      inflightPublishPackages.add(packetId);
+    }
     try {
       producer.publishMessage(producerId, -1, buf, 1, false, false, null);
     } catch (Throwable ex) {
@@ -597,7 +609,7 @@ public class Connection extends ChannelInboundHandlerAdapter
       long producerId, long sequenceId, long highestId, long ledgerId, long entryId) {
     final Integer packetId = inflightPublishPackages.poll();
     if (packetId == null) {
-      log.warn(""); // todo handle exception
+      // qos 0 message do not need receipt
       return;
     }
     publishAckAsync(packetId, CONNECTION_ACCEPTED, MqttProperties.NO_PROPERTIES);
@@ -628,7 +640,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                   "Receive an error while ack publishes the package.  connection={}",
                   this,
                   Throwables.getRootCause(ex));
-              closeAsync();
+              closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
               return null;
             });
   }
@@ -665,7 +677,7 @@ public class Connection extends ChannelInboundHandlerAdapter
   private static final int STATUS_REJECTED = 2;
   private static final int STATUS_CLOSED = 3;
 
-  private void closeAsync() {
+  private void closeAsync(byte reasonCode) {
     // DCL start
     if (STATUS_UPDATER.get(this) == STATUS_CLOSED) {
       return;
@@ -678,7 +690,16 @@ public class Connection extends ChannelInboundHandlerAdapter
     }
     // DCL end
     log.info("Closing the connection. client_id={} client_address={}", clientId, clientAddress());
-    wrap(ctx.close())
+    final CompletableFuture<Void> disconnectMessageFuture;
+    if (version.protocolLevel() > MqttVersion.MQTT_5.protocolLevel()) {
+      final MqttMessage disconnectMessage =
+          MqttMessageBuilders.disconnect().reasonCode(reasonCode).build();
+      disconnectMessageFuture = wrap(ctx.writeAndFlush(disconnectMessage));
+    } else {
+      disconnectMessageFuture = CompletableFuture.completedFuture(null);
+    }
+    disconnectMessageFuture
+        .thenCompose(__ -> wrap(ctx.close()))
         .thenAccept(
             __ -> {
               log.info(
