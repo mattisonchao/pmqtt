@@ -35,7 +35,6 @@ import org.eclipse.jetty.servlet.ServletContextHandler;
 
 @Slf4j
 public final class MqttProtocolHandler implements ProtocolHandler {
-  public static final String HANDLER_NAME = "mqtt";
   private MqttOptions options;
   private MqttContext mqttContext;
 

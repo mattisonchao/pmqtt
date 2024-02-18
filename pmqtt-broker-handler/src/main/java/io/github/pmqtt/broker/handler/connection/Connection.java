@@ -271,12 +271,11 @@ public class Connection extends ChannelInboundHandlerAdapter
     switch (fixed.messageType()) {
       case CONNECT -> handleConnect((MqttConnectMessage) msg);
       case PUBLISH -> handlePublish((MqttPublishMessage) msg);
+
       case AUTH -> {
         return;
       }
-      case SUBSCRIBE -> {
-        return;
-      }
+
       case UNSUBSCRIBE -> {
         return;
       }
@@ -286,9 +285,7 @@ public class Connection extends ChannelInboundHandlerAdapter
       case PINGRESP -> {
         return;
       }
-      case DISCONNECT -> {
-        return;
-      }
+      case DISCONNECT -> {}
       default -> throw new UnsupportedOperationException();
     }
   }

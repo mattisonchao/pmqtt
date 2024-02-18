@@ -1,7 +1,6 @@
 package io.github.pmqtt.broker.handler.web.endpoints.v1;
 
-import static io.github.pmqtt.broker.handler.MqttProtocolHandler.HANDLER_NAME;
-
+import io.github.pmqtt.broker.handler.env.Constants;
 import io.github.pmqtt.broker.handler.web.base.AbstractEndpoint;
 import io.github.pmqtt.broker.handler.web.entity.URI;
 import io.swagger.annotations.Api;
@@ -73,7 +72,7 @@ public final class MqttTopicLookup extends AbstractEndpoint {
               final ProtocolHandlers protocolHandlers = pulsarService.getProtocolHandlers();
               final Optional<SocketAddress> mqttHandlerEndpoint =
                   protocolHandlers.getEndpoints().entrySet().stream()
-                      .filter(entry -> entry.getValue().equals(HANDLER_NAME))
+                      .filter(entry -> entry.getValue().equals(Constants.PROTOCOL_NAME))
                       .map(Map.Entry::getKey)
                       .findAny();
               if (mqttHandlerEndpoint.isEmpty()) {
