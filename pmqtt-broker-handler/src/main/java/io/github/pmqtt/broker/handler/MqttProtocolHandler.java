@@ -66,6 +66,19 @@ public final class MqttProtocolHandler implements ProtocolHandler {
       this.mqttContext = new MqttContext(pulsar, options);
       initializeDefaultNamespace(service, options);
       initializeWebService(service);
+      final String[] lines =
+          """
+              ,------. ,--.   ,--. ,-----.,--------.,--------.
+              |  .--. '|   `.'   |'  .-.  '--.  .--''--.  .--'
+              |  '--' ||  |'.'|  ||  | |  |  |  |      |  |
+              |  | --' |  |   |  |'  '-'  '-.|  |      |  |
+              `--'     `--'   `--' `-----'--'`--'      `--'
+              """
+              .split("\n");
+      for (String line : lines) {
+        log.info(line);
+      }
+      log.info("MQTT Protocol handler has been loaded. the options={}", options);
     } catch (Exception ex) {
       log.error("Start mqtt protocol handler failed. options={}", options, ex);
       throw new IllegalStateException(ex);
@@ -74,7 +87,6 @@ public final class MqttProtocolHandler implements ProtocolHandler {
 
   @SuppressWarnings("unchecked")
   private void initializeWebService(@NotNull BrokerService service) throws Exception {
-    // Set the logger level to DEBUG
     final String handlerPath = "/mqtt";
     // ----- initialize the static field
     AbstractEndpoint.pulsarService = service.getPulsar();

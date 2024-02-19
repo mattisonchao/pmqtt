@@ -14,7 +14,6 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-
 import lombok.Cleanup;
 import lombok.SneakyThrows;
 import org.apache.commons.lang3.tuple.Pair;
@@ -73,12 +72,12 @@ public final class V3PublishTest extends AbstractPulsarCluster {
     }
     final Message<byte[]> message = consumer.receive(2, TimeUnit.SECONDS);
     if (message == null) {
-        if (qos == MqttQos.AT_MOST_ONCE) {
-          // success
-          return;
-        } else {
-          Assert.fail("At least once can't lost message");
-        }
+      if (qos == MqttQos.AT_MOST_ONCE) {
+        // success
+        return;
+      } else {
+        Assert.fail("At least once can't lost message");
+      }
     }
     final byte[] data = message.getData();
     Assert.assertEquals(data, payload);
