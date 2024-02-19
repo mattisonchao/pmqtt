@@ -2,3 +2,4 @@ rootProject.name = 'pmqtt'
 
 include("pmqtt-broker-handler")
 include("pmqtt-integration")
+include("examples:hivemq")
