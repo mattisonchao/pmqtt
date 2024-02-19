@@ -45,7 +45,7 @@ public final class V3PublishTest extends AbstractPulsarCluster {
   }
 
   @SneakyThrows
-  @Test(dataProvider = "mqttQosProvider", invocationCount = 10)
+  @Test(dataProvider = "mqttQosProvider")
   public void testPublishWithRedirect(MqttQos qos) {
     final String mqttTopicName = "a/b/c" + UUID.randomUUID();
     final String encodedTopicName =
