@@ -569,6 +569,8 @@ public class Connection extends ChannelInboundHandlerAdapter
 
   private final BlockingQueue<Integer> inflightPublishPackages = new ArrayBlockingQueue<>(5000);
 
+  private static final int NO_ACK_PACKET_ID = -1;
+
   private void publishAsync(
       @Nonnull Producer producer, @Nonnull MqttPublishMessage publishMessage) {
     final var producerId = producer.getProducerId();
@@ -585,10 +587,10 @@ public class Connection extends ChannelInboundHandlerAdapter
     final var buf =
         Commands.serializeMetadataAndPayload(Commands.ChecksumType.Crc32c, metadata, payload);
     payload.release();
-    // only send ack when qos greater than 1
-    if (publishMessage.fixedHeader().qosLevel().value() >= MqttQoS.AT_LEAST_ONCE.value()) {
-      inflightPublishPackages.add(packetId);
-    }
+    inflightPublishPackages.add(
+        publishMessage.fixedHeader().qosLevel().value() >= MqttQoS.AT_LEAST_ONCE.value()
+            ? packetId
+            : NO_ACK_PACKET_ID);
     try {
       producer.publishMessage(producerId, -1, buf, 1, false, false, null);
     } catch (Throwable ex) {
@@ -601,6 +603,14 @@ public class Connection extends ChannelInboundHandlerAdapter
       long producerId, long sequenceId, long highestId, long ledgerId, long entryId) {
     final Integer packetId = inflightPublishPackages.poll();
     if (packetId == null) {
+      log.warn(
+          "Received a send receipt without packet id. producer={}, ledger_id={}, entry_id={}",
+          producerFuture.getNow(null),
+          ledgerId,
+          entryId);
+      return;
+    }
+    if (packetId == NO_ACK_PACKET_ID) {
       // qos 0 message do not need receipt
       return;
     }
@@ -611,13 +621,20 @@ public class Connection extends ChannelInboundHandlerAdapter
   public void sendSendError(long producerId, long sequenceId, ServerError error, String errorMsg) {
     final Integer packetId = inflightPublishPackages.poll();
     if (packetId == null) {
-      log.warn("Received a send error without packet id. producer={} error_code={} error_message={}",
-              producerFuture.getNow(null) , error, errorMsg);
+      log.warn(
+          "Received a send error without packet id. producer={} error_code={} error_message={}",
+          producerFuture.getNow(null),
+          error,
+          errorMsg);
       // ignore the empty packet id
       return;
     }
-    log.error("Received an error while publishing message. packet_id={} producer={} error_code={} error_message={}",
-            packetId, producerFuture.getNow(null) , error, errorMsg);
+    log.error(
+        "Received an error while publishing message. packet_id={} producer={} error_code={} error_message={}",
+        packetId,
+        producerFuture.getNow(null),
+        error,
+        errorMsg);
     publishAckAsync(packetId, CONNECTION_REFUSED_UNSPECIFIED_ERROR, MqttProperties.NO_PROPERTIES);
   }
 
