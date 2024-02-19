@@ -4,6 +4,7 @@ import static io.github.pmqtt.broker.handler.utils.future.CompletableFutures.wra
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_ACCEPTED;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_CLIENT_IDENTIFIER_NOT_VALID;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_IDENTIFIER_REJECTED;
+import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_NOT_AUTHORIZED_5;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_SERVER_MOVED;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_TOPIC_NAME_INVALID;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_UNACCEPTABLE_PROTOCOL_VERSION;
@@ -13,6 +14,7 @@ import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUS
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import io.github.pmqtt.broker.handler.MqttContext;
+import io.github.pmqtt.broker.handler.exceptions.UnauthorizedException;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -81,6 +83,7 @@ import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.api.proto.ProducerAccessMode;
 import org.apache.pulsar.common.api.proto.ServerError;
 import org.apache.pulsar.common.compression.CompressionCodecProvider;
+import org.apache.pulsar.common.policies.data.TopicOperation;
 import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.protocol.schema.SchemaVersion;
 import org.apache.pulsar.common.schema.SchemaInfo;
@@ -504,8 +507,20 @@ public class Connection extends ChannelInboundHandlerAdapter
     if (producerFuture == null) {
       // producer future will be running in the single netty io thread.
       producerFuture =
-          getBrokerService()
-              .getOrCreateTopic(pulsarTopicName.toString())
+          mqttContext
+              .getPulsarService()
+              .getBrokerService()
+              .getAuthorizationService()
+              .allowTopicOperationAsync(
+                  pulsarTopicName, TopicOperation.PRODUCE, null, subject, null)
+              .thenCompose(
+                  authorized -> {
+                    if (!authorized) {
+                      throw new UnauthorizedException(
+                          subject, pulsarTopicName.toString(), TopicOperation.PRODUCE.name());
+                    }
+                    return getBrokerService().getOrCreateTopic(pulsarTopicName.toString());
+                  })
               .thenCompose(
                   topic -> {
                     final var producer =
@@ -553,7 +568,16 @@ public class Connection extends ChannelInboundHandlerAdapter
                 // todo: mqtt 5 disconnect property support
                 return null;
               }
-              log.error("Received an exception while publish message.", ex);
+              if (rc instanceof UnauthorizedException) {
+                log.warn(rc.getMessage());
+                closeAsync(CONNECTION_REFUSED_NOT_AUTHORIZED_5.byteValue());
+                return null;
+              }
+              log.error(
+                  "Received an exception while publish message. mqtt_topic_name={} producer={}",
+                  mqttTopicName,
+                  producerFuture.getNow(null),
+                  ex);
               closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
               return null;
             });
