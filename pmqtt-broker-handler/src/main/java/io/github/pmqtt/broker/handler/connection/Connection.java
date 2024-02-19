@@ -4,7 +4,6 @@ import static io.github.pmqtt.broker.handler.utils.future.CompletableFutures.wra
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_ACCEPTED;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_CLIENT_IDENTIFIER_NOT_VALID;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_IDENTIFIER_REJECTED;
-import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_QOS_NOT_SUPPORTED;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_SERVER_MOVED;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_TOPIC_NAME_INVALID;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_UNACCEPTABLE_PROTOCOL_VERSION;
@@ -54,9 +53,6 @@ import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import javax.annotation.Nonnull;
 import javax.validation.constraints.NotNull;
@@ -271,11 +267,9 @@ public class Connection extends ChannelInboundHandlerAdapter
     switch (fixed.messageType()) {
       case CONNECT -> handleConnect((MqttConnectMessage) msg);
       case PUBLISH -> handlePublish((MqttPublishMessage) msg);
-
-      case AUTH -> {
+      case SUBSCRIBE -> {
         return;
       }
-
       case UNSUBSCRIBE -> {
         return;
       }
@@ -283,6 +277,11 @@ public class Connection extends ChannelInboundHandlerAdapter
         return;
       }
       case PINGRESP -> {
+        return;
+      }
+      case AUTH -> {
+        log.warn("received unsupported message auth type.");
+        closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
         return;
       }
       case DISCONNECT -> {}
@@ -490,36 +489,21 @@ public class Connection extends ChannelInboundHandlerAdapter
             });
   }
 
-  private Producer producer;
+  private CompletableFuture<Producer> producerFuture;
   private static final int PRODUCER_ID = 0; // only support single producer here
 
   private void handlePublish(@Nonnull MqttPublishMessage message) {
     final var var = message.variableHeader();
     final var fix = message.fixedHeader();
     if (fix.qosLevel() == MqttQoS.EXACTLY_ONCE) {
-      final MqttConnectReturnCode code =
-          version.protocolLevel() >= MqttVersion.MQTT_5.protocolLevel()
-              ? CONNECTION_REFUSED_QOS_NOT_SUPPORTED
-              : CONNECTION_REFUSED_UNSPECIFIED_ERROR;
-      publishAckAsync(var.packetId(), code, MqttProperties.NO_PROPERTIES);
+      closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
       return;
     }
     final var mqttTopicName = var.topicName();
     final var pulsarTopicName = mqttContext.getConverter().convert(mqttTopicName);
-    if (producer != null) {
-      if (!Objects.equals(pulsarTopicName.toString(), producer.getTopic().getName())) {
-        final MqttConnectReturnCode code =
-            version.protocolLevel() >= MqttVersion.MQTT_5.protocolLevel()
-                ? CONNECTION_REFUSED_TOPIC_NAME_INVALID
-                : CONNECTION_REFUSED_UNSPECIFIED_ERROR;
-        publishAckAsync(var.packetId(), code, MqttProperties.NO_PROPERTIES);
-        return;
-      }
-      publishAsync(message);
-      return;
-    }
-    try {
-      producer =
+    if (producerFuture == null) {
+      // producer future will be running in the single netty io thread.
+      producerFuture =
           getBrokerService()
               .getOrCreateTopic(pulsarTopicName.toString())
               .thenCompose(
@@ -542,26 +526,37 @@ public class Connection extends ChannelInboundHandlerAdapter
                     return topic
                         .addProducer(producer, new CompletableFuture<>())
                         .thenApply(topicEpoch -> producer);
-                  })
-              .get(30, TimeUnit.SECONDS); // back pressure here
-      publishAsync(message);
-    } catch (InterruptedException | ExecutionException | TimeoutException ex) {
-      final Throwable rc = FutureUtil.unwrapCompletionException(ex);
-      if (rc instanceof BrokerServiceException.ServiceUnitNotReadyException) {
-        if (version.protocolLevel() < MqttVersion.MQTT_5.protocolLevel()) {
-          log.warn(
-              "The topic is not owned by the current broker. mqtt_topic_name={}  pulsar_topic_name={}",
-              mqttTopicName,
-              pulsarTopicName);
-          closeAsync(CONNECTION_REFUSED_SERVER_MOVED.byteValue());
-          return;
-        } else {
-          // send disconnect to client
-          System.out.println(1);
-        }
-      }
-      log.error("Received an exception.", ex);
+                  });
     }
+    producerFuture // todo: we should give a pending limit here.
+        .thenAccept(
+            producer -> {
+              if (!Objects.equals(pulsarTopicName.toString(), producer.getTopic().getName())) {
+                final MqttConnectReturnCode code =
+                    version.protocolLevel() >= MqttVersion.MQTT_5.protocolLevel()
+                        ? CONNECTION_REFUSED_TOPIC_NAME_INVALID
+                        : CONNECTION_REFUSED_UNSPECIFIED_ERROR;
+                publishAckAsync(var.packetId(), code, MqttProperties.NO_PROPERTIES);
+                return;
+              }
+              publishAsync(producer, message);
+            })
+        .exceptionally(
+            ex -> {
+              final Throwable rc = FutureUtil.unwrapCompletionException(ex);
+              if (rc instanceof BrokerServiceException.ServiceUnitNotReadyException) {
+                log.warn(
+                    "The topic is not owned by the current broker. mqtt_topic_name={}  pulsar_topic_name={}",
+                    mqttTopicName,
+                    pulsarTopicName);
+                closeAsync(CONNECTION_REFUSED_SERVER_MOVED.byteValue());
+                // todo: mqtt 5 disconnect property support
+                return null;
+              }
+              log.error("Received an exception while publish message.", ex);
+              closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
+              return null;
+            });
   }
 
   private static final FastThreadLocal<MessageMetadata> LOCAL_MESSAGE_METADATA =
@@ -574,7 +569,8 @@ public class Connection extends ChannelInboundHandlerAdapter
 
   private final BlockingQueue<Integer> inflightPublishPackages = new ArrayBlockingQueue<>(5000);
 
-  private void publishAsync(@Nonnull MqttPublishMessage publishMessage) {
+  private void publishAsync(
+      @Nonnull Producer producer, @Nonnull MqttPublishMessage publishMessage) {
     final var producerId = producer.getProducerId();
     final var metadata = LOCAL_MESSAGE_METADATA.get();
     final int packetId = publishMessage.variableHeader().packetId();
@@ -596,7 +592,6 @@ public class Connection extends ChannelInboundHandlerAdapter
     try {
       producer.publishMessage(producerId, -1, buf, 1, false, false, null);
     } catch (Throwable ex) {
-      log.warn(""); // todo exception
       sendSendError(producerId, -1, ServerError.UnknownError, ex.getMessage());
     }
   }
@@ -616,9 +611,13 @@ public class Connection extends ChannelInboundHandlerAdapter
   public void sendSendError(long producerId, long sequenceId, ServerError error, String errorMsg) {
     final Integer packetId = inflightPublishPackages.poll();
     if (packetId == null) {
-      log.warn(""); // todo handle exception
+      log.warn("Received a send error without packet id. producer={} error_code={} error_message={}",
+              producerFuture.getNow(null) , error, errorMsg);
+      // ignore the empty packet id
       return;
     }
+    log.error("Received an error while publishing message. packet_id={} producer={} error_code={} error_message={}",
+            packetId, producerFuture.getNow(null) , error, errorMsg);
     publishAckAsync(packetId, CONNECTION_REFUSED_UNSPECIFIED_ERROR, MqttProperties.NO_PROPERTIES);
   }
 

@@ -7,8 +7,14 @@ dependencies {
 test {
     doFirst {
         jvmArgs += [
+                '--add-opens', 'java.base/jdk.internal.loader=ALL-UNNAMED',
+                '--add-opens', 'java.base/java.lang=ALL-UNNAMED',
                 '--add-opens', 'java.base/java.io=ALL-UNNAMED',
-                '--add-opens', 'java.base/jdk.internal.platform=ALL-UNNAMED',
+                '--add-opens', 'java.base/java.util=ALL-UNNAMED',
+                '--add-opens', 'java.base/sun.net=ALL-UNNAMED',
+                '--add-opens', 'java.management/sun.management=ALL-UNNAMED',
+                '--add-opens', 'jdk.management/com.sun.management.internal=ALL-UNNAMED',
+                '--add-opens', 'java.base/jdk.internal.platform=ALL-UNNAMED'
         ]
     }
 }

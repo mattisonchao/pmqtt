@@ -1,4 +1,4 @@
-package io.github.pmqtt.broker.packages;
+package io.github.pmqtt.broker.packets;
 
 import com.hivemq.client.mqtt.MqttClient;
 import com.hivemq.client.mqtt.mqtt5.Mqtt5BlockingClient;
