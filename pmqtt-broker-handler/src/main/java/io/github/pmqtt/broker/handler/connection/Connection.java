@@ -276,19 +276,12 @@ public class Connection extends ChannelInboundHandlerAdapter
       case UNSUBSCRIBE -> {
         return;
       }
-      case PINGREQ -> {
-        return;
-      }
-      case PINGRESP -> {
-        return;
-      }
-      case AUTH -> {
+      case DISCONNECT -> {}
+      case PINGREQ -> handlePing();
+      default -> {
         log.warn("received unsupported message auth type.");
         closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
-        return;
       }
-      case DISCONNECT -> {}
-      default -> throw new UnsupportedOperationException();
     }
   }
 
@@ -490,6 +483,15 @@ public class Connection extends ChannelInboundHandlerAdapter
                   Throwables.getRootCause(ex));
               return null;
             });
+  }
+
+
+  private void handlePing() {
+      wrap(ctx.writeAndFlush(MqttMessage.PINGRESP))
+              .exceptionally(ex -> {
+                log.warn("Receive an error while send ping response. ctx={}", ctx);
+                return null;
+              });
   }
 
   private CompletableFuture<Producer> producerFuture;
