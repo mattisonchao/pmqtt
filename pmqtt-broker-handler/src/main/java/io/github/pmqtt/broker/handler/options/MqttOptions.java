@@ -8,6 +8,7 @@ import org.apache.pulsar.broker.ServiceConfiguration;
 public record MqttOptions(
     @NotNull InetSocketAddress listenSocketAddress,
     boolean authenticationEnabled,
+    boolean authorizationEnabled,
     @NotNull String defaultTenant,
     @NotNull String defaultNamespace,
     @NotNull String mqttTopicNameConverter) {
@@ -21,6 +22,7 @@ public record MqttOptions(
   private static final String MQTT_LISTEN_PORT = "mqttListenPort";
   // ----- authentication
   private static final String MQTT_AUTHENTICATION_ENABLED = "false";
+  private static final String MQTT_AUTHORIZATION_ENABLED = "false";
 
   public static @NotNull MqttOptions parse(@NotNull ServiceConfiguration brokerConfiguration) {
     final Properties properties =
@@ -32,6 +34,8 @@ public record MqttOptions(
     final boolean authenticationEnabled =
         Boolean.parseBoolean(
             (String) properties.getOrDefault(MQTT_AUTHENTICATION_ENABLED, "false"));
+    final boolean authorizationEnabled =
+        Boolean.parseBoolean((String) properties.getOrDefault(MQTT_AUTHORIZATION_ENABLED, "false"));
     final String defaultTenant = (String) properties.getOrDefault(MQTT_DEFAULT_TENANT, "mqtt");
     final String defaultNamespace =
         (String) properties.getOrDefault(MQTT_DEFAULT_NAMESPACE, "default");
@@ -46,6 +50,7 @@ public record MqttOptions(
     return new MqttOptions(
         socketAddress,
         authenticationEnabled,
+        authorizationEnabled,
         defaultTenant,
         defaultNamespace,
         mqttTopicNameConverter);

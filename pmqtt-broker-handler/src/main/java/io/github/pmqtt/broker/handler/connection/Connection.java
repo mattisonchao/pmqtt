@@ -506,13 +506,20 @@ public class Connection extends ChannelInboundHandlerAdapter
     final var pulsarTopicName = mqttContext.getConverter().convert(mqttTopicName);
     if (producerFuture == null) {
       // producer future will be running in the single netty io thread.
+      final CompletableFuture<Boolean> authFuture;
+      if (mqttContext.getMqttOptions().authorizationEnabled()) {
+        authFuture =
+            mqttContext
+                .getPulsarService()
+                .getBrokerService()
+                .getAuthorizationService()
+                .allowTopicOperationAsync(
+                    pulsarTopicName, TopicOperation.PRODUCE, null, subject, null);
+      } else {
+        authFuture = CompletableFuture.completedFuture(true);
+      }
       producerFuture =
-          mqttContext
-              .getPulsarService()
-              .getBrokerService()
-              .getAuthorizationService()
-              .allowTopicOperationAsync(
-                  pulsarTopicName, TopicOperation.PRODUCE, null, subject, null)
+          authFuture
               .thenCompose(
                   authorized -> {
                     if (!authorized) {
