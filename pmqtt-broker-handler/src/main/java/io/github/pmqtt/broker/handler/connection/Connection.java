@@ -418,7 +418,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                   clientId,
                   clientAddress());
             })
-        .exceptionallyCompose(
+        .exceptionally(
             ex -> {
               log.error(
                   "Receive an error while accepting connection.  connection={}",
