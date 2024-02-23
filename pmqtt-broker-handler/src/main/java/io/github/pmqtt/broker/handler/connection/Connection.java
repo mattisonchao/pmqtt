@@ -14,6 +14,7 @@ import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUS
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import io.github.pmqtt.broker.handler.MqttContext;
+import io.github.pmqtt.broker.handler.exceptions.UnConnectedException;
 import io.github.pmqtt.broker.handler.exceptions.UnauthorizedException;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
@@ -267,21 +268,45 @@ public class Connection extends ChannelInboundHandlerAdapter
           CONNECTION_REFUSED_UNACCEPTABLE_PROTOCOL_VERSION, MqttProperties.NO_PROPERTIES);
       return;
     }
-    switch (fixed.messageType()) {
-      case CONNECT -> handleConnect((MqttConnectMessage) msg);
-      case PUBLISH -> handlePublish((MqttPublishMessage) msg);
-      case SUBSCRIBE -> {
-        return;
+    try {
+      switch (fixed.messageType()) {
+        case CONNECT -> handleConnect((MqttConnectMessage) msg);
+        case PUBLISH -> {
+          checkConnectionEstablish();
+          handlePublish((MqttPublishMessage) msg);
+          break;
+        }
+        case SUBSCRIBE -> {
+          checkConnectionEstablish();
+          break;
+        }
+        case UNSUBSCRIBE -> {
+          checkConnectionEstablish();
+          break;
+        }
+        case DISCONNECT -> {
+          checkConnectionEstablish();
+          break;
+        }
+        case PINGREQ -> handlePing();
+        default -> {
+          log.warn("received unsupported message auth type.");
+          closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
+        }
       }
-      case UNSUBSCRIBE -> {
-        return;
+    } catch (Throwable ex) {
+      if (ex instanceof UnConnectedException) {
+        log.info("{} connection={}", ex.getMessage(), this);
+      } else {
+        log.error("Receive an exception while process message.");
       }
-      case DISCONNECT -> {}
-      case PINGREQ -> handlePing();
-      default -> {
-        log.warn("received unsupported message auth type.");
-        closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
-      }
+      closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
+    }
+  }
+
+  private void checkConnectionEstablish() {
+    if (STATUS_UPDATER.get(this) != STATUS_ACCEPTED) {
+      throw new UnConnectedException();
     }
   }
 
@@ -485,13 +510,13 @@ public class Connection extends ChannelInboundHandlerAdapter
             });
   }
 
-
   private void handlePing() {
-      wrap(ctx.writeAndFlush(MqttMessage.PINGRESP))
-              .exceptionally(ex -> {
-                log.warn("Receive an error while send ping response. ctx={}", ctx);
-                return null;
-              });
+    wrap(ctx.writeAndFlush(MqttMessage.PINGRESP))
+        .exceptionally(
+            ex -> {
+              log.warn("Receive an error while send ping response. ctx={}", ctx);
+              return null;
+            });
   }
 
   private CompletableFuture<Producer> producerFuture;
