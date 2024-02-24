@@ -14,11 +14,15 @@ import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUS
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import io.github.pmqtt.broker.handler.MqttContext;
+import io.github.pmqtt.broker.handler.converter.TopicNameConverter;
 import io.github.pmqtt.broker.handler.exceptions.UnConnectedException;
 import io.github.pmqtt.broker.handler.exceptions.UnauthorizedException;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.DecoderResult;
 import io.netty.handler.codec.UnsupportedMessageTypeException;
 import io.netty.handler.codec.haproxy.HAProxyMessage;
@@ -32,9 +36,12 @@ import io.netty.handler.codec.mqtt.MqttMessage;
 import io.netty.handler.codec.mqtt.MqttMessageBuilders;
 import io.netty.handler.codec.mqtt.MqttMessageType;
 import io.netty.handler.codec.mqtt.MqttProperties;
+import io.netty.handler.codec.mqtt.MqttPubAckMessage;
 import io.netty.handler.codec.mqtt.MqttPublishMessage;
 import io.netty.handler.codec.mqtt.MqttQoS;
+import io.netty.handler.codec.mqtt.MqttSubAckMessage;
 import io.netty.handler.codec.mqtt.MqttSubscribeMessage;
+import io.netty.handler.codec.mqtt.MqttTopicSubscription;
 import io.netty.handler.codec.mqtt.MqttUnacceptableProtocolVersionException;
 import io.netty.handler.codec.mqtt.MqttVersion;
 import io.netty.handler.timeout.IdleState;
@@ -43,9 +50,11 @@ import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.concurrent.FastThreadLocal;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.Promise;
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -56,6 +65,7 @@ import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import javax.annotation.Nonnull;
 import javax.validation.constraints.NotNull;
@@ -75,20 +85,28 @@ import org.apache.pulsar.broker.service.Producer;
 import org.apache.pulsar.broker.service.PulsarCommandSender;
 import org.apache.pulsar.broker.service.RedeliveryTracker;
 import org.apache.pulsar.broker.service.Subscription;
+import org.apache.pulsar.broker.service.SubscriptionOption;
 import org.apache.pulsar.broker.service.TransportCnx;
 import org.apache.pulsar.client.api.CompressionType;
+import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.transaction.TxnID;
 import org.apache.pulsar.common.api.proto.CommandLookupTopicResponse;
+import org.apache.pulsar.common.api.proto.CommandSubscribe;
 import org.apache.pulsar.common.api.proto.CommandTopicMigrated;
+import org.apache.pulsar.common.api.proto.KeySharedMeta;
+import org.apache.pulsar.common.api.proto.KeySharedMode;
 import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.api.proto.ProducerAccessMode;
 import org.apache.pulsar.common.api.proto.ServerError;
+import org.apache.pulsar.common.api.proto.SingleMessageMetadata;
 import org.apache.pulsar.common.compression.CompressionCodecProvider;
+import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.policies.data.TopicOperation;
 import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.protocol.schema.SchemaVersion;
 import org.apache.pulsar.common.schema.SchemaInfo;
 import org.apache.pulsar.common.util.FutureUtil;
+import org.roaringbitmap.RoaringBitmap;
 
 @ToString
 @Slf4j
@@ -278,7 +296,13 @@ public class Connection extends ChannelInboundHandlerAdapter
         }
         case SUBSCRIBE -> {
           checkConnectionEstablish();
+          // todo check subscribe status
+          handleSubscribe((MqttSubscribeMessage) msg);
           break;
+        }
+        case PUBACK -> {
+          checkConnectionEstablish();
+          handlePubAck((MqttPubAckMessage) msg);
         }
         case UNSUBSCRIBE -> {
           checkConnectionEstablish();
@@ -598,7 +622,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                     "The topic is not owned by the current broker. mqtt_topic_name={}  pulsar_topic_name={}",
                     mqttTopicName,
                     pulsarTopicName);
-                closeAsync(CONNECTION_REFUSED_SERVER_MOVED.byteValue());
+                handleTopicDoesNotOwnedByCurrentBroker();
                 // todo: mqtt 5 disconnect property support
                 return null;
               }
@@ -716,9 +740,143 @@ public class Connection extends ChannelInboundHandlerAdapter
             });
   }
 
-  private Consumer consumer;
+  private CompletableFuture<Consumer> consumerFuture;
+  private final long consumerId = 0;
+  private final int priorityLevel = 0;
+  private final int consumerEpoch = 0;
+  private MqttQoS consumerQos;
+  private static final int PERMITS_TOTAL = 1000;
+  private final AtomicInteger pendingFlowPermits = new AtomicInteger(0);
 
-  private void handleSubscribe(@Nonnull MqttSubscribeMessage subscribeMessage) {}
+  private static final KeySharedMeta EMPTY_KEY_SHARED_METADATA =
+      new KeySharedMeta().setKeySharedMode(KeySharedMode.AUTO_SPLIT);
+
+  private void handleSubscribe(@Nonnull MqttSubscribeMessage subscribeMessage) {
+    final var var = subscribeMessage.idAndPropertiesVariableHeader();
+    final var payload = subscribeMessage.payload();
+    final int packetId = var.messageId();
+    final List<MqttTopicSubscription> subscriptions = payload.topicSubscriptions();
+    final var subscription = subscriptions.get(0); // only support single topic
+
+    this.consumerQos = subscription.qualityOfService();
+    final String mqttTopicName = subscription.topicName();
+    final TopicName pulsarTopicName = mqttContext.getConverter().convert(mqttTopicName);
+    final String subscriptionName = clientId;
+    final String consumerName = clientId;
+    // producer future will be running in the single netty io thread.
+    final CompletableFuture<Boolean> authFuture;
+    if (mqttContext.getMqttOptions().authorizationEnabled()) {
+      authFuture =
+          mqttContext
+              .getPulsarService()
+              .getBrokerService()
+              .getAuthorizationService()
+              .allowTopicOperationAsync(
+                  pulsarTopicName, TopicOperation.SUBSCRIBE, null, subject, null);
+    } else {
+      authFuture = CompletableFuture.completedFuture(true);
+    }
+    if (consumerFuture != null) {
+      return;
+    }
+    consumerFuture =
+        authFuture
+            .thenCompose(
+                authorized -> {
+                  if (!authorized) {
+                    throw new UnauthorizedException(
+                        subject, pulsarTopicName.toString(), TopicOperation.CONSUME.name());
+                  }
+                  return getBrokerService().getOrCreateTopic(pulsarTopicName.toString());
+                })
+            .thenCompose(
+                topic ->
+                    getBrokerService()
+                        .isAllowAutoSubscriptionCreationAsync(pulsarTopicName)
+                        .thenAccept(
+                            isAllowedAutoSubscriptionCreation -> {
+                              if (!isAllowedAutoSubscriptionCreation
+                                  && !topic.getSubscriptions().containsKey(subscriptionName)
+                                  && topic.isPersistent()) {
+                                // todo finish the authorization check
+                                throw new IllegalStateException("");
+                              }
+                            })
+                        .thenCompose(
+                            __ -> {
+                              final SubscriptionOption option =
+                                  SubscriptionOption.builder()
+                                      .cnx(this)
+                                      .subscriptionName(subscriptionName)
+                                      .consumerId(consumerId)
+                                      .subType(CommandSubscribe.SubType.Shared)
+                                      .priorityLevel(priorityLevel)
+                                      .consumerName(consumerName)
+                                      .isDurable(true)
+                                      .startMessageId(MessageId.latest)
+                                      .metadata(Collections.emptyMap())
+                                      .readCompacted(false)
+                                      .initialPosition(CommandSubscribe.InitialPosition.Latest)
+                                      .startMessageRollbackDurationSec(-1)
+                                      .replicatedSubscriptionStateArg(false)
+                                      .keySharedMeta(EMPTY_KEY_SHARED_METADATA)
+                                      .subscriptionProperties(Optional.empty())
+                                      .consumerEpoch(consumerEpoch)
+                                      .build();
+                              return topic.subscribe(option);
+                            }));
+    consumerFuture
+        .thenCompose(
+            consumer -> {
+              final MqttSubAckMessage message =
+                  MqttMessageBuilders.subAck()
+                      .packetId(packetId)
+                      .addGrantedQos(consumerQos)
+                      .build();
+              return wrap(ctx.writeAndFlush(message))
+                  .thenAccept(__ -> consumer.flowPermits(PERMITS_TOTAL));
+            })
+        .thenAccept(
+            __ -> {
+              log.info(
+                  "Subscribed on topic. consumer={} subscription={} mqtt_topic_name={}"
+                      + " pulsar_topic_name={} client_address={}",
+                  consumerName,
+                  subscriptionName,
+                  mqttTopicName,
+                  pulsarTopicName,
+                  clientAddress());
+            })
+        .exceptionally(
+            ex -> {
+              final Throwable rc = FutureUtil.unwrapCompletionException(ex);
+              if (rc instanceof BrokerServiceException.ServiceUnitNotReadyException) {
+                log.warn(
+                    "The topic is not owned by the current broker. mqtt_topic_name={}  pulsar_topic_name={}",
+                    mqttTopicName,
+                    pulsarTopicName);
+                handleTopicDoesNotOwnedByCurrentBroker();
+                return null;
+              }
+              log.error(
+                  "Received an error while subscribe on topic. consumer={} subscription={} mqtt_topic_name={}"
+                      + " pulsar_topic_name={} client_address={}",
+                  consumerName,
+                  subscriptionName,
+                  mqttTopicName,
+                  pulsarTopicName,
+                  clientAddress(),
+                  rc);
+              closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
+              return null;
+            });
+  }
+
+  private void handlePubAck(MqttPubAckMessage msg) {
+    final var var = msg.variableHeader();
+    final int packetId = var.messageId();
+    packetIdBitMap.remove(packetId);
+  }
 
   // ------ mqtt socket properties
   private ChannelHandlerContext ctx;
@@ -798,10 +956,20 @@ public class Connection extends ChannelInboundHandlerAdapter
   @Override
   public void sendErrorResponse(long requestId, ServerError error, String message) {}
 
+  private final RoaringBitmap packetIdBitMap = RoaringBitmap.bitmapOfRange(0, 65535);
+
+  private static final FastThreadLocal<SingleMessageMetadata> LOCAL_SINGLE_MESSAGE_METADATA =
+      new FastThreadLocal<>() {
+        @Override
+        protected SingleMessageMetadata initialValue() {
+          return new SingleMessageMetadata();
+        }
+      };
+
   @Override
   public Future<Void> sendMessagesToConsumer(
       long consumerId,
-      String topicName,
+      String pulsarTopicNameStr,
       Subscription subscription,
       int partitionIdx,
       List<? extends Entry> entries,
@@ -809,7 +977,114 @@ public class Connection extends ChannelInboundHandlerAdapter
       EntryBatchIndexesAcks batchIndexesAcks,
       RedeliveryTracker redeliveryTracker,
       long epoch) {
-    return null;
+    final TopicName pulsarTopicName = TopicName.get(pulsarTopicNameStr);
+    final TopicNameConverter converter = mqttContext.getConverter();
+    final ChannelPromise writePromise = ctx.newPromise();
+    // single thread to avoid concurrent problem
+    // protect `packetIdBitMap`,
+    execute(
+        () -> {
+          final List<Entry> entriesToRelease = new ArrayList<>(entries.size());
+          final List<MqttMessageBuilders.PublishBuilder> mqttPublishMessages =
+              makeSemiFinishedPublishMessages(entries, entriesToRelease, pulsarTopicNameStr);
+          for (MqttMessageBuilders.PublishBuilder pubBuilder : mqttPublishMessages) {
+            final int packetId =
+                consumerQos == MqttQoS.AT_MOST_ONCE
+                    ? NO_ACK_PACKET_ID // at most once do not need packet id
+                    : (int) packetIdBitMap.nextAbsentValue(0);
+            final MqttPublishMessage message =
+                pubBuilder
+                    .messageId(packetId)
+                    .qos(consumerQos)
+                    .topicName(converter.convert(pulsarTopicName))
+                    .build();
+            ctx.write(message, ctx.voidPromise());
+          }
+
+          // Use an empty write here so that we can just tie the flush with the write promise for
+          // last
+          // entry
+          ctx.writeAndFlush(Unpooled.EMPTY_BUFFER, writePromise);
+          writePromise.addListener(
+              (future) -> {
+                // release the entries only after flushing the channel
+                //
+                // InflightReadsLimiter tracks the amount of memory retained by in-flight data to
+                // the
+                // consumer. It counts the memory as being released when the entry is deallocated
+                // that is that it reaches refcnt=0.
+                // so we need to call release only when we are sure that Netty released the internal
+                // ByteBuf
+                entriesToRelease.forEach(Entry::release);
+                if (future.isSuccess()) {
+                  int pendingFlowTotal = pendingFlowPermits.addAndGet(entries.size());
+                  if (pendingFlowTotal >= PERMITS_TOTAL / 2) {
+                    if (pendingFlowPermits.compareAndSet(pendingFlowTotal, 0)) {
+                      final Consumer consumer = consumerFuture.join();
+                      consumer.flowPermits(pendingFlowTotal);
+                    }
+                  }
+                } else {
+                  // todo handle the unexpected exception
+                  log.error(
+                      "Receive an error while writing the message to client. client_address={} topic_name={}",
+                      clientSourceAddress(),
+                      pulsarTopicNameStr,
+                      future.cause());
+                }
+              });
+          batchSizes.recyle();
+          if (batchIndexesAcks != null) {
+            batchIndexesAcks.recycle();
+          }
+        });
+    return writePromise;
+  }
+
+  private static List<MqttMessageBuilders.PublishBuilder> makeSemiFinishedPublishMessages(
+      List<? extends Entry> entries, List<Entry> entriesToRelease, String pulsarTopicName) {
+    final List<MqttMessageBuilders.PublishBuilder> mqttPublishMessages = new ArrayList<>();
+    for (final Entry entry : entries) {
+      if (entry == null) {
+        // Entry was filtered out
+        continue;
+      }
+      final ByteBuf payload = entry.getDataBuffer();
+      final MessageMetadata metadata = Commands.parseMessageMetadata(payload);
+      if (metadata.hasNumMessagesInBatch()) {
+        int batchSize = metadata.getNumMessagesInBatch();
+        try {
+          for (int i = 0; i < batchSize; i++) {
+            final SingleMessageMetadata metadata1 = LOCAL_SINGLE_MESSAGE_METADATA.get();
+            metadata1.clear();
+            final ByteBuf payload1 =
+                Commands.deSerializeSingleMessageInBatch(payload, metadata1, i, batchSize);
+            mqttPublishMessages.add(makeMqttPubMessageByMetadataAndPayload(metadata1, payload1));
+          }
+        } catch (IOException ex) {
+          log.warn(
+              "Receive an error while decoding the batch pulsar format message,"
+                  + " skip delivering entry but not ack it.  topic_name={} ledger_id={} entry_id={}",
+              pulsarTopicName,
+              entry.getLedgerId(),
+              entry.getEntryId());
+        }
+      } else {
+        mqttPublishMessages.add(makeMqttPubMessageByMetadataAndPayload(metadata, payload));
+      }
+      entriesToRelease.add(entry);
+    }
+    return mqttPublishMessages;
+  }
+
+  private static MqttMessageBuilders.PublishBuilder makeMqttPubMessageByMetadataAndPayload(
+      Object metadata, ByteBuf payload) {
+    // todo support mqtt5
+    return MqttMessageBuilders.publish().payload(payload);
+  }
+
+  private void handleTopicDoesNotOwnedByCurrentBroker() {
+    closeAsync(CONNECTION_REFUSED_SERVER_MOVED.byteValue());
   }
 
   // ---------- useless methods

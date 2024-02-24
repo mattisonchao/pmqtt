@@ -18,7 +18,7 @@ final class URLEncodeTopicNameConverter implements TopicNameConverter {
   public void init(@NotNull TopicNameConverterConf conf) {
     this.defaultTenant = conf.defaultTenant();
     this.defaultNamespace = conf.defaultNamespace();
-    this.defaultTopicPrefix = "persistent://" + defaultTenant + "/" + defaultNamespace;
+    this.defaultTopicPrefix = "persistent://" + defaultTenant + "/" + defaultNamespace + "/";
   }
 
   @Override
@@ -43,7 +43,7 @@ final class URLEncodeTopicNameConverter implements TopicNameConverter {
     final String topicNameStr = pulsarTopicName.toString();
     // if default
     if (topicNameStr.startsWith(defaultTopicPrefix)) {
-      final String encodedTopicName = topicNameStr.replace(defaultNamespace, "");
+      final String encodedTopicName = topicNameStr.replace(defaultTopicPrefix, "");
       return URLDecoder.decode(encodedTopicName, StandardCharsets.UTF_8);
     }
     return topicNameStr;

@@ -1,25 +1,17 @@
 package io.github.pmqtt.broker.packets;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.hivemq.client.mqtt.MqttClient;
 import com.hivemq.client.mqtt.datatypes.MqttQos;
 import com.hivemq.client.mqtt.exceptions.MqttSessionExpiredException;
 import com.hivemq.client.mqtt.mqtt3.Mqtt3BlockingClient;
 import io.github.pmqtt.broker.base.AbstractPulsarCluster;
-import java.net.URI;
 import java.net.URLEncoder;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import lombok.Cleanup;
 import lombok.SneakyThrows;
-import org.apache.commons.lang3.tuple.Pair;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.Message;
-import org.apache.pulsar.common.util.ObjectMapperFactory;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
@@ -82,49 +74,6 @@ public final class V3PublishTest extends AbstractPulsarCluster {
     final byte[] data = message.getData();
     Assert.assertEquals(data, payload);
     mqtt3BlockingClient.disconnect();
-  }
-
-  private Mqtt3BlockingClient createAutoLookupClient(String mqttTopicName) {
-    final Pair<String, Integer> hostAndPort = getMqttHostAndPort();
-    return MqttClient.builder()
-        .useMqttVersion3()
-        .identifier(UUID.randomUUID().toString())
-        .serverHost(hostAndPort.getLeft())
-        .serverPort(hostAndPort.getRight())
-        .automaticReconnectWithDefaultConfig()
-        .addDisconnectedListener(
-            connector -> {
-              try {
-                final String webServiceAddress = broker1.getWebServiceAddress();
-                final HttpRequest request =
-                    HttpRequest.newBuilder()
-                        .uri(
-                            URI.create(
-                                webServiceAddress
-                                    + "/mqtt/v1/lookup?topic="
-                                    + URLEncoder.encode(mqttTopicName, StandardCharsets.UTF_8)))
-                        .GET()
-                        .build();
-                final HttpClient httpClient =
-                    HttpClient.newBuilder().followRedirects(HttpClient.Redirect.ALWAYS).build();
-                final HttpResponse<String> res =
-                    httpClient.send(
-                        request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-                final String result = res.body();
-                final JsonNode data =
-                    ObjectMapperFactory.getMapper().getObjectMapper().readTree(result);
-                connector
-                    .getReconnector()
-                    .transportConfig()
-                    .serverHost(data.get("host").asText())
-                    .serverPort(data.get("port").asInt())
-                    .applyTransportConfig();
-              } catch (Throwable e) {
-                throw new RuntimeException(e);
-              }
-            })
-        .build()
-        .toBlocking();
   }
 
   // --- failed cases
