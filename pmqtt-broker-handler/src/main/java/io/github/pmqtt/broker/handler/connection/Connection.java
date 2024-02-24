@@ -296,7 +296,6 @@ public class Connection extends ChannelInboundHandlerAdapter
         }
         case SUBSCRIBE -> {
           checkConnectionEstablish();
-          // todo check subscribe status
           handleSubscribe((MqttSubscribeMessage) msg);
           break;
         }
@@ -310,6 +309,7 @@ public class Connection extends ChannelInboundHandlerAdapter
         }
         case DISCONNECT -> {
           checkConnectionEstablish();
+          closeAsync(CLOSE_NO_REASON);
           break;
         }
         case PINGREQ -> handlePing();
@@ -777,6 +777,8 @@ public class Connection extends ChannelInboundHandlerAdapter
       authFuture = CompletableFuture.completedFuture(true);
     }
     if (consumerFuture != null) {
+      log.warn("Receive a duplicated subscribe request. the current version of plugin only support single subscribe." +
+               " client_address={} client_id={}", clientSourceAddress(), clientId);
       return;
     }
     consumerFuture =
@@ -906,6 +908,8 @@ public class Connection extends ChannelInboundHandlerAdapter
   private static final int STATUS_REJECTED = 2;
   private static final int STATUS_CLOSED = 3;
 
+
+  private static final byte CLOSE_NO_REASON = -1;
   private void closeAsync(byte reasonCode) {
     // DCL start
     if (STATUS_UPDATER.get(this) == STATUS_CLOSED) {
@@ -920,7 +924,7 @@ public class Connection extends ChannelInboundHandlerAdapter
     // DCL end
     log.info("Closing the connection. client_id={} client_address={}", clientId, clientAddress());
     final CompletableFuture<Void> disconnectMessageFuture;
-    if (version.protocolLevel() > MqttVersion.MQTT_5.protocolLevel()) {
+    if (reasonCode != CLOSE_NO_REASON && version.protocolLevel() > MqttVersion.MQTT_5.protocolLevel()) {
       final MqttMessage disconnectMessage =
           MqttMessageBuilders.disconnect().reasonCode(reasonCode).build();
       disconnectMessageFuture = wrap(ctx.writeAndFlush(disconnectMessage));
