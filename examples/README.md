@@ -6,3 +6,4 @@ This directory includes the MQTT client examples are as follows:
 - [Mosquitto (C)](./mosquitto)
 - [Mqttjs (NodeJs)](./mqttjs)
 - [Paho (Python)](./paho-py)
+- [Paho (Go)](./paho-go)
