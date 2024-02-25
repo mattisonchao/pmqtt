@@ -60,6 +60,7 @@ public abstract class AbstractPulsarCluster implements AutoCloseable {
     brokerConf.setBrokerServicePort(Optional.of(0));
     brokerConf.setMetadataStoreUrl("zk:127.0.0.1:" + ensemble.getZookeeperPort());
     brokerConf.setConfigurationMetadataStoreUrl("zk:127.0.0.1:" + ensemble.getZookeeperPort());
+    brokerConf.setMaxUnackedMessagesPerConsumer(0);
     // set pmqtt protocol handler
     brokerConf.setProtocolHandlerDirectory(narDir);
     brokerConf.setMessagingProtocols(Set.of("mqtt"));

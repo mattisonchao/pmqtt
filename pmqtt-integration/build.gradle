@@ -2,6 +2,7 @@ dependencies {
     testImplementation "org.apache.pulsar:pulsar-broker:${getProperty("pulsar.version")}"
     testImplementation "com.hivemq:hivemq-mqtt-client:${getProperty("hivemq.version")}"
     testImplementation 'org.slf4j:slf4j-simple:2.0.12'
+    testImplementation 'org.awaitility:awaitility:4.2.0'
 }
 
 test {

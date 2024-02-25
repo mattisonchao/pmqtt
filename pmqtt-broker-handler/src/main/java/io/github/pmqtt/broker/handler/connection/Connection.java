@@ -56,10 +56,12 @@ import java.net.SocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
@@ -72,6 +74,7 @@ import javax.validation.constraints.NotNull;
 import lombok.ToString;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.mledger.Entry;
+import org.apache.bookkeeper.mledger.Position;
 import org.apache.pulsar.broker.authentication.AuthenticationDataCommand;
 import org.apache.pulsar.broker.authentication.AuthenticationDataSource;
 import org.apache.pulsar.broker.authentication.AuthenticationProvider;
@@ -90,11 +93,13 @@ import org.apache.pulsar.broker.service.TransportCnx;
 import org.apache.pulsar.client.api.CompressionType;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.transaction.TxnID;
+import org.apache.pulsar.common.api.proto.CommandAck;
 import org.apache.pulsar.common.api.proto.CommandLookupTopicResponse;
 import org.apache.pulsar.common.api.proto.CommandSubscribe;
 import org.apache.pulsar.common.api.proto.CommandTopicMigrated;
 import org.apache.pulsar.common.api.proto.KeySharedMeta;
 import org.apache.pulsar.common.api.proto.KeySharedMode;
+import org.apache.pulsar.common.api.proto.MessageIdData;
 import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.api.proto.ProducerAccessMode;
 import org.apache.pulsar.common.api.proto.ServerError;
@@ -741,9 +746,9 @@ public class Connection extends ChannelInboundHandlerAdapter
   }
 
   private CompletableFuture<Consumer> consumerFuture;
-  private final long consumerId = 0;
-  private final int priorityLevel = 0;
-  private final int consumerEpoch = 0;
+  private static final long CONSUMER_ID = 0;
+  private static final int PRIORITY_LEVEL = 0;
+  private static final int CONSUMER_EPOCH = 0;
   private MqttQoS consumerQos;
   private static final int PERMITS_TOTAL = 1000;
   private final AtomicInteger pendingFlowPermits = new AtomicInteger(0);
@@ -777,8 +782,11 @@ public class Connection extends ChannelInboundHandlerAdapter
       authFuture = CompletableFuture.completedFuture(true);
     }
     if (consumerFuture != null) {
-      log.warn("Receive a duplicated subscribe request. the current version of plugin only support single subscribe." +
-               " client_address={} client_id={}", clientSourceAddress(), clientId);
+      log.warn(
+          "Receive a duplicated subscribe request. the current version of plugin only support single subscribe."
+              + " client_address={} client_id={}",
+          clientSourceAddress(),
+          clientId);
       return;
     }
     consumerFuture =
@@ -810,9 +818,9 @@ public class Connection extends ChannelInboundHandlerAdapter
                                   SubscriptionOption.builder()
                                       .cnx(this)
                                       .subscriptionName(subscriptionName)
-                                      .consumerId(consumerId)
+                                      .consumerId(CONSUMER_ID)
                                       .subType(CommandSubscribe.SubType.Shared)
-                                      .priorityLevel(priorityLevel)
+                                      .priorityLevel(PRIORITY_LEVEL)
                                       .consumerName(consumerName)
                                       .isDurable(true)
                                       .startMessageId(MessageId.latest)
@@ -823,7 +831,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                                       .replicatedSubscriptionStateArg(false)
                                       .keySharedMeta(EMPTY_KEY_SHARED_METADATA)
                                       .subscriptionProperties(Optional.empty())
-                                      .consumerEpoch(consumerEpoch)
+                                      .consumerEpoch(CONSUMER_EPOCH)
                                       .build();
                               return topic.subscribe(option);
                             }));
@@ -874,10 +882,49 @@ public class Connection extends ChannelInboundHandlerAdapter
             });
   }
 
+  private final RoaringBitmap packetIdBitMap = new RoaringBitmap();
+  private final Map<Integer, PacketIdContext> packetContexts = new TreeMap<>();
+  private static final int MAX_PACKET_ID = 65535;
+
   private void handlePubAck(MqttPubAckMessage msg) {
     final var var = msg.variableHeader();
     final int packetId = var.messageId();
+    final PacketIdContext context = packetContexts.remove(packetId);
     packetIdBitMap.remove(packetId);
+    final Consumer consumer = consumerFuture.getNow(null);
+    if (consumer == null) {
+      // it shouldn't happen
+      log.error(
+          "Get empty consumer when ack qos 1 messages, it should be a bug here."
+              + " mqtt_packet_id={} message_context={}",
+          packetId,
+          context);
+      return;
+    }
+    // todo batch ack request
+    final CommandAck commandAck = new CommandAck();
+    final CommandAck ack =
+        commandAck
+            .setAckType(CommandAck.AckType.Individual)
+            .setConsumerId(CONSUMER_ID)
+            .setRequestId(-1);
+    final MessageIdData ackMessageId =
+        ack.addMessageId().setLedgerId(context.getLedgerId()).setEntryId(context.getEntryId());
+    if (context.isBatch()) {
+      for (int i = 0; i < context.getBatchSize(); i++) {
+        ackMessageId.addAckSet(context.getBatchIndex() == i ? 0 : 1);
+      }
+    }
+    consumer
+        .messageAcked(ack)
+        .exceptionally(
+            ex -> {
+              log.error(
+                  "Receive an error while acknowledge message. packet_id={} packet_context={}",
+                  packetId,
+                  context);
+              return null;
+            });
   }
 
   // ------ mqtt socket properties
@@ -908,8 +955,8 @@ public class Connection extends ChannelInboundHandlerAdapter
   private static final int STATUS_REJECTED = 2;
   private static final int STATUS_CLOSED = 3;
 
-
   private static final byte CLOSE_NO_REASON = -1;
+
   private void closeAsync(byte reasonCode) {
     // DCL start
     if (STATUS_UPDATER.get(this) == STATUS_CLOSED) {
@@ -924,7 +971,8 @@ public class Connection extends ChannelInboundHandlerAdapter
     // DCL end
     log.info("Closing the connection. client_id={} client_address={}", clientId, clientAddress());
     final CompletableFuture<Void> disconnectMessageFuture;
-    if (reasonCode != CLOSE_NO_REASON && version.protocolLevel() > MqttVersion.MQTT_5.protocolLevel()) {
+    if (reasonCode != CLOSE_NO_REASON
+        && version.protocolLevel() > MqttVersion.MQTT_5.protocolLevel()) {
       final MqttMessage disconnectMessage =
           MqttMessageBuilders.disconnect().reasonCode(reasonCode).build();
       disconnectMessageFuture = wrap(ctx.writeAndFlush(disconnectMessage));
@@ -960,8 +1008,6 @@ public class Connection extends ChannelInboundHandlerAdapter
   @Override
   public void sendErrorResponse(long requestId, ServerError error, String message) {}
 
-  private final RoaringBitmap packetIdBitMap = RoaringBitmap.bitmapOfRange(0, 65535);
-
   private static final FastThreadLocal<SingleMessageMetadata> LOCAL_SINGLE_MESSAGE_METADATA =
       new FastThreadLocal<>() {
         @Override
@@ -988,14 +1034,33 @@ public class Connection extends ChannelInboundHandlerAdapter
     // protect `packetIdBitMap`,
     execute(
         () -> {
+          final Set<Integer> insufficientPacketIdEntryIndexes = new HashSet<>();
           final List<Entry> entriesToRelease = new ArrayList<>(entries.size());
-          final List<MqttMessageBuilders.PublishBuilder> mqttPublishMessages =
+          final List<SemiFinishedPubMessage> mqttPublishMessages =
               makeSemiFinishedPublishMessages(entries, entriesToRelease, pulsarTopicNameStr);
-          for (MqttMessageBuilders.PublishBuilder pubBuilder : mqttPublishMessages) {
+          for (final SemiFinishedPubMessage semiFinishedPubMessage : mqttPublishMessages) {
+            final var pubBuilder = semiFinishedPubMessage.getPublishBuilder();
+            final int entryIndex = semiFinishedPubMessage.getEntryIndex();
+            final Entry originalEntry = entries.get(entryIndex);
+            final int batchSize = batchSizes.getBatchSize(entryIndex);
+            // packet id generation
             final int packetId =
                 consumerQos == MqttQoS.AT_MOST_ONCE
-                    ? NO_ACK_PACKET_ID // at most once do not need packet id
-                    : (int) packetIdBitMap.nextAbsentValue(0);
+                    ? NO_ACK_PACKET_ID
+                    : (int) packetIdBitMap.nextAbsentValue(1);
+            if (packetId > MAX_PACKET_ID) {
+              insufficientPacketIdEntryIndexes.add(entryIndex);
+              continue;
+            }
+            packetIdBitMap.add(packetId);
+            final var packetIdContextBuilder =
+                PacketIdContext.builder()
+                    .ledgerId(originalEntry.getLedgerId())
+                    .entryId(originalEntry.getEntryId())
+                    .batchSize(batchSize)
+                    .batchIndex(semiFinishedPubMessage.getBatchIndex());
+            packetContexts.put(packetId, packetIdContextBuilder.build());
+
             final MqttPublishMessage message =
                 pubBuilder
                     .messageId(packetId)
@@ -1006,11 +1071,71 @@ public class Connection extends ChannelInboundHandlerAdapter
           }
 
           // Use an empty write here so that we can just tie the flush with the write promise for
-          // last
-          // entry
+          // the last entry.
           ctx.writeAndFlush(Unpooled.EMPTY_BUFFER, writePromise);
           writePromise.addListener(
               (future) -> {
+                final Consumer consumer = consumerFuture.getNow(null);
+                if (future.isSuccess()) {
+                  if (consumer != null) {
+                    // acknowledge qos0 messages because qos0 don't need ack
+                    if (consumerQos == MqttQoS.AT_MOST_ONCE) {
+                      final List<Position> needAckEntries =
+                          entries.stream().map(Entry::getPosition).toList();
+                      consumer
+                          .getSubscription()
+                          .acknowledgeMessage(
+                              needAckEntries,
+                              CommandAck.AckType.Individual,
+                              Collections.emptyMap());
+                    }
+
+                    // todo the loop redeliver may drain the resources, we need find out a good way
+                    // to avoid loop redelivery
+                    // redeliver messages due to insufficient packet id
+                    int totalRedeliveredMessageNum = 0;
+                    final List<MessageIdData> redeliverMessages = new ArrayList<>();
+                    for (int insufficientPacketIdEntryIndex : insufficientPacketIdEntryIndexes) {
+                      totalRedeliveredMessageNum +=
+                          batchSizes.getBatchSize(insufficientPacketIdEntryIndex);
+                      final Entry entry = entries.get(insufficientPacketIdEntryIndex);
+                      final MessageIdData messageIdData = new MessageIdData();
+                      messageIdData.setLedgerId(entry.getLedgerId());
+                      messageIdData.setEntryId(entry.getEntryId());
+                      redeliverMessages.add(messageIdData);
+                    }
+                    consumer.redeliverUnacknowledgedMessages(redeliverMessages);
+
+                    // Do not flow permits while packet id has been exhausted.
+                    if (!insufficientPacketIdEntryIndexes.isEmpty()) {
+                      consumer.flowPermits(totalRedeliveredMessageNum);
+                    } else {
+                      int pendingFlowTotal =
+                          pendingFlowPermits.addAndGet(mqttPublishMessages.size());
+                      if (pendingFlowTotal >= PERMITS_TOTAL / 2) {
+                        if (pendingFlowPermits.compareAndSet(pendingFlowTotal, 0)) {
+                          consumer.flowPermits(pendingFlowTotal);
+                        }
+                      }
+                    }
+                  } else {
+                    // it shouldn't happen
+                    log.error(
+                        "Get empty consumer when ack qos 0 messages, it should be a bug here.");
+                  }
+                } else {
+                  // redeliver all the messages
+                  entries.forEach(
+                      entry ->
+                          redeliveryTracker.incrementAndGetRedeliveryCount(entry.getPosition()));
+
+                  log.error(
+                      "Receive an error while writing the message to client. client_address={} topic_name={}",
+                      clientSourceAddress(),
+                      pulsarTopicNameStr,
+                      future.cause());
+                }
+
                 // release the entries only after flushing the channel
                 //
                 // InflightReadsLimiter tracks the amount of memory retained by in-flight data to
@@ -1020,22 +1145,6 @@ public class Connection extends ChannelInboundHandlerAdapter
                 // so we need to call release only when we are sure that Netty released the internal
                 // ByteBuf
                 entriesToRelease.forEach(Entry::release);
-                if (future.isSuccess()) {
-                  int pendingFlowTotal = pendingFlowPermits.addAndGet(entries.size());
-                  if (pendingFlowTotal >= PERMITS_TOTAL / 2) {
-                    if (pendingFlowPermits.compareAndSet(pendingFlowTotal, 0)) {
-                      final Consumer consumer = consumerFuture.join();
-                      consumer.flowPermits(pendingFlowTotal);
-                    }
-                  }
-                } else {
-                  // todo handle the unexpected exception
-                  log.error(
-                      "Receive an error while writing the message to client. client_address={} topic_name={}",
-                      clientSourceAddress(),
-                      pulsarTopicNameStr,
-                      future.cause());
-                }
               });
           batchSizes.recyle();
           if (batchIndexesAcks != null) {
@@ -1045,10 +1154,11 @@ public class Connection extends ChannelInboundHandlerAdapter
     return writePromise;
   }
 
-  private static List<MqttMessageBuilders.PublishBuilder> makeSemiFinishedPublishMessages(
+  private static List<SemiFinishedPubMessage> makeSemiFinishedPublishMessages(
       List<? extends Entry> entries, List<Entry> entriesToRelease, String pulsarTopicName) {
-    final List<MqttMessageBuilders.PublishBuilder> mqttPublishMessages = new ArrayList<>();
-    for (final Entry entry : entries) {
+    final List<SemiFinishedPubMessage> mqttPublishMessages = new ArrayList<>();
+    for (int entryIndex = 0; entryIndex < entries.size(); entryIndex++) {
+      final Entry entry = entries.get(entryIndex);
       if (entry == null) {
         // Entry was filtered out
         continue;
@@ -1058,12 +1168,18 @@ public class Connection extends ChannelInboundHandlerAdapter
       if (metadata.hasNumMessagesInBatch()) {
         int batchSize = metadata.getNumMessagesInBatch();
         try {
-          for (int i = 0; i < batchSize; i++) {
+          for (int batchIndex = 0; batchIndex < batchSize; batchIndex++) {
             final SingleMessageMetadata metadata1 = LOCAL_SINGLE_MESSAGE_METADATA.get();
             metadata1.clear();
             final ByteBuf payload1 =
-                Commands.deSerializeSingleMessageInBatch(payload, metadata1, i, batchSize);
-            mqttPublishMessages.add(makeMqttPubMessageByMetadataAndPayload(metadata1, payload1));
+                Commands.deSerializeSingleMessageInBatch(payload, metadata1, batchIndex, batchSize);
+            final var builder = makeMqttPubMessageByMetadataAndPayload(metadata1, payload1);
+            mqttPublishMessages.add(
+                SemiFinishedPubMessage.builder()
+                    .entryIndex(entryIndex)
+                    .batchIndex(batchIndex)
+                    .publishBuilder(builder)
+                    .build());
           }
         } catch (IOException ex) {
           log.warn(
@@ -1074,7 +1190,12 @@ public class Connection extends ChannelInboundHandlerAdapter
               entry.getEntryId());
         }
       } else {
-        mqttPublishMessages.add(makeMqttPubMessageByMetadataAndPayload(metadata, payload));
+        final var builder = makeMqttPubMessageByMetadataAndPayload(metadata, payload);
+        mqttPublishMessages.add(
+            SemiFinishedPubMessage.builder()
+                .entryIndex(entryIndex)
+                .publishBuilder(builder)
+                .build());
       }
       entriesToRelease.add(entry);
     }
