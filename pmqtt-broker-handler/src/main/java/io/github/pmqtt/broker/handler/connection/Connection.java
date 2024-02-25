@@ -297,12 +297,10 @@ public class Connection extends ChannelInboundHandlerAdapter
         case PUBLISH -> {
           checkConnectionEstablish();
           handlePublish((MqttPublishMessage) msg);
-          break;
         }
         case SUBSCRIBE -> {
           checkConnectionEstablish();
           handleSubscribe((MqttSubscribeMessage) msg);
-          break;
         }
         case PUBACK -> {
           checkConnectionEstablish();
@@ -310,12 +308,10 @@ public class Connection extends ChannelInboundHandlerAdapter
         }
         case UNSUBSCRIBE -> {
           checkConnectionEstablish();
-          break;
         }
         case DISCONNECT -> {
           checkConnectionEstablish();
           closeAsync(CLOSE_NO_REASON);
-          break;
         }
         case PINGREQ -> handlePing();
         default -> {
