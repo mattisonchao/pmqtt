@@ -1086,24 +1086,24 @@ public class Connection extends ChannelInboundHandlerAdapter
                               Collections.emptyMap());
                     }
 
-                    // todo the loop redeliver may drain the resources, we need find out a good way
-                    // to avoid loop redelivery
-                    // redeliver messages due to insufficient packet id
-                    int totalRedeliveredMessageNum = 0;
-                    final List<MessageIdData> redeliverMessages = new ArrayList<>();
-                    for (int insufficientPacketIdEntryIndex : insufficientPacketIdEntryIndexes) {
-                      totalRedeliveredMessageNum +=
-                          batchSizes.getBatchSize(insufficientPacketIdEntryIndex);
-                      final Entry entry = entries.get(insufficientPacketIdEntryIndex);
-                      final MessageIdData messageIdData = new MessageIdData();
-                      messageIdData.setLedgerId(entry.getLedgerId());
-                      messageIdData.setEntryId(entry.getEntryId());
-                      redeliverMessages.add(messageIdData);
-                    }
-                    consumer.redeliverUnacknowledgedMessages(redeliverMessages);
-
                     // Do not flow permits while packet id has been exhausted.
                     if (!insufficientPacketIdEntryIndexes.isEmpty()) {
+                      // todo the loop redeliver may drain the resources, we need find out a good
+                      // way
+                      // to avoid loop redelivery
+                      // redeliver messages due to insufficient packet id
+                      int totalRedeliveredMessageNum = 0;
+                      final List<MessageIdData> redeliverMessages = new ArrayList<>();
+                      for (int insufficientPacketIdEntryIndex : insufficientPacketIdEntryIndexes) {
+                        totalRedeliveredMessageNum +=
+                            batchSizes.getBatchSize(insufficientPacketIdEntryIndex);
+                        final Entry entry = entries.get(insufficientPacketIdEntryIndex);
+                        final MessageIdData messageIdData = new MessageIdData();
+                        messageIdData.setLedgerId(entry.getLedgerId());
+                        messageIdData.setEntryId(entry.getEntryId());
+                        redeliverMessages.add(messageIdData);
+                      }
+                      consumer.redeliverUnacknowledgedMessages(redeliverMessages);
                       consumer.flowPermits(totalRedeliveredMessageNum);
                     } else {
                       int pendingFlowTotal =

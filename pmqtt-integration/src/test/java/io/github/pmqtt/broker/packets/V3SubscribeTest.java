@@ -9,7 +9,10 @@ import com.hivemq.client.mqtt.mqtt3.message.subscribe.suback.Mqtt3SubAck;
 import io.github.pmqtt.broker.base.AbstractPulsarCluster;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import lombok.Cleanup;
 import lombok.SneakyThrows;
@@ -130,13 +133,13 @@ public final class V3SubscribeTest extends AbstractPulsarCluster {
       unAckMessages.add(message);
       Assert.assertEquals(message.getPayloadAsBytes(), (i + "").getBytes(StandardCharsets.UTF_8));
     }
-    final Optional<Mqtt3Publish> receivedMessage = publishes.receive(5, TimeUnit.SECONDS);
+    final Optional<Mqtt3Publish> receivedMessage = publishes.receive(2, TimeUnit.SECONDS);
     // we should never receive the last message due to insufficient packet id.
     Assert.assertTrue(receivedMessage.isEmpty());
     // Ack messages
     unAckMessages.forEach(Mqtt3Publish::acknowledge);
 
-    final Optional<Mqtt3Publish> receivedMessage1 = publishes.receive(5, TimeUnit.SECONDS);
+    final Optional<Mqtt3Publish> receivedMessage1 = publishes.receive(2, TimeUnit.SECONDS);
     Assert.assertTrue(receivedMessage1.isPresent());
     mqtt3BlockingClient.disconnect();
   }
