@@ -10,6 +10,7 @@ import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUS
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_UNACCEPTABLE_PROTOCOL_VERSION;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_UNSPECIFIED_ERROR;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_UNSUPPORTED_PROTOCOL_VERSION;
+import static org.apache.pulsar.common.util.FutureUtil.wrapToCompletionException;
 
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
@@ -43,6 +44,7 @@ import io.netty.handler.codec.mqtt.MqttSubAckMessage;
 import io.netty.handler.codec.mqtt.MqttSubscribeMessage;
 import io.netty.handler.codec.mqtt.MqttTopicSubscription;
 import io.netty.handler.codec.mqtt.MqttUnacceptableProtocolVersionException;
+import io.netty.handler.codec.mqtt.MqttUnsubscribeMessage;
 import io.netty.handler.codec.mqtt.MqttVersion;
 import io.netty.handler.timeout.IdleState;
 import io.netty.handler.timeout.IdleStateEvent;
@@ -308,6 +310,7 @@ public class Connection extends ChannelInboundHandlerAdapter
         }
         case UNSUBSCRIBE -> {
           checkConnectionEstablish();
+          handleUnsubscribe((MqttUnsubscribeMessage) msg);
         }
         case DISCONNECT -> {
           checkConnectionEstablish();
@@ -874,6 +877,53 @@ public class Connection extends ChannelInboundHandlerAdapter
                   clientAddress(),
                   rc);
               closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
+              return null;
+            });
+  }
+
+  private void handleUnsubscribe(MqttUnsubscribeMessage msg) {
+    final var var = msg.idAndPropertiesVariableHeader();
+    final int packetId = var.messageId();
+    final var payload = msg.payload();
+    final var mqttTopicName = payload.topics().get(0);
+
+    final var consumerFuturePointer = consumerFuture;
+    // pulsar do not support unsubscribe shared subscription
+    final CompletableFuture<Void> future;
+    if (consumerFuture != null) {
+      future =
+          consumerFuture.thenAccept(
+              consumer -> {
+                try {
+                  consumer.close();
+                } catch (BrokerServiceException ex) {
+                  throw wrapToCompletionException(ex);
+                }
+              });
+    } else {
+      future = CompletableFuture.completedFuture(null);
+    }
+    future
+        .thenAcceptAsync(
+            __ -> {
+              // using single thread to check the status to ensure the concurrent modification
+              if (consumerFuture != null && consumerFuture == consumerFuturePointer) {
+                // reset consumer future then the client can sub to another topic
+                consumerFuture = null;
+              }
+            },
+            ctx.channel().eventLoop())
+        .thenCompose(
+            __ ->
+                wrap(ctx.writeAndFlush(MqttMessageBuilders.unsubAck().packetId(packetId).build())))
+        .exceptionally(
+            ex -> {
+              log.error(
+                  "Receive an error while unsubscribe the topic. packet_id={} "
+                      + "mqtt_topic_name={} pulsar_topic_name={}",
+                  packetId,
+                  mqttTopicName,
+                  mqttContext.getConverter().convert(mqttTopicName));
               return null;
             });
   }
