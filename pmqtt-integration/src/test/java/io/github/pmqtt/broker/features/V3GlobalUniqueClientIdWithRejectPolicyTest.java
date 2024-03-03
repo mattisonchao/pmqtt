@@ -14,7 +14,7 @@ import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
-public final class V3GlobalUniqueClientIdTest extends AbstractPulsarCluster {
+public final class V3GlobalUniqueClientIdWithRejectPolicyTest extends AbstractPulsarCluster {
   @BeforeClass
   void setup() {
     enableMqttCoordinator();
@@ -60,11 +60,7 @@ public final class V3GlobalUniqueClientIdTest extends AbstractPulsarCluster {
 
     bc.disconnect();
 
-    Awaitility.await()
-        .untilAsserted(
-            () -> {
-              Assert.assertNotNull(bc2.connect());
-            });
+    Awaitility.await().untilAsserted(() -> Assert.assertNotNull(bc2.connect()));
 
     bc2.disconnect();
   }
@@ -111,7 +107,6 @@ public final class V3GlobalUniqueClientIdTest extends AbstractPulsarCluster {
                 bc2.connect();
               } catch (Mqtt3ConnAckException ex) {
                 Assert.fail("unexpected behaviour");
-                Thread.sleep(100);
               }
             });
 

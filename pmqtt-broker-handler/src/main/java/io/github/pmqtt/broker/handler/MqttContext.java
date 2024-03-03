@@ -42,7 +42,7 @@ public final class MqttContext extends ChannelInitializer<SocketChannel> {
     this.coordinator =
         mqttOptions.coordinatorEnabled()
             ? CoordinatorFactory.createMetadata(
-                pulsarService.getCoordinationService().getLockManager(String.class))
+                pulsarService, mqttOptions.duplicatedClientIdPolicy())
             : CoordinatorDisable.INSTANCE;
   }
 

@@ -76,6 +76,11 @@ public abstract class AbstractPulsarCluster implements AutoCloseable {
       properties.put("mqttCoordinatorEnabled", "true");
     }
     brokerConf.setProperties(properties);
+    configureMqttConfig(properties);
+  }
+
+  protected void configureMqttConfig(Properties properties) {
+    // no-op
   }
 
   protected Pair<String, Integer> getMqttHostAndPort() {

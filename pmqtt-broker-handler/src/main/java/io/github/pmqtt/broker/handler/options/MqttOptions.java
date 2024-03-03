@@ -1,6 +1,7 @@
 package io.github.pmqtt.broker.handler.options;
 
 import java.net.InetSocketAddress;
+import java.util.Locale;
 import java.util.Properties;
 import javax.validation.constraints.NotNull;
 import org.apache.pulsar.broker.ServiceConfiguration;
@@ -12,7 +13,8 @@ public record MqttOptions(
     @NotNull String defaultTenant,
     @NotNull String defaultNamespace,
     @NotNull String mqttTopicNameConverter,
-    boolean coordinatorEnabled) {
+    boolean coordinatorEnabled,
+    @NotNull DuplicatedClientIdPolicy duplicatedClientIdPolicy) {
 
   // ----- converter
   private static final String MQTT_TOPIC_NAME_CONVERTER = "mqttTopicNameConverter";
@@ -27,6 +29,8 @@ public record MqttOptions(
 
   // ----- coordinator
   private static final String MQTT_COORDINATOR_ENABLED = "mqttCoordinatorEnabled";
+
+  private static final String MQTT_DUPLICATED_CLIENT_ID_POLICY = "mqttDuplicatedClientIdPolicy";
 
   public static @NotNull MqttOptions parse(@NotNull ServiceConfiguration brokerConfiguration) {
     final Properties properties =
@@ -51,6 +55,12 @@ public record MqttOptions(
 
     final boolean coordinatorEnabled =
         Boolean.parseBoolean((String) properties.getOrDefault(MQTT_COORDINATOR_ENABLED, "false"));
+    final DuplicatedClientIdPolicy duplicatedClientIdPolicy =
+        DuplicatedClientIdPolicy.valueOf(
+            String.valueOf(
+                    properties.getOrDefault(
+                        MQTT_DUPLICATED_CLIENT_ID_POLICY, DuplicatedClientIdPolicy.REJECT.name()))
+                .toUpperCase(Locale.ROOT));
 
     final InetSocketAddress socketAddress =
         new InetSocketAddress(listenAddress, Integer.parseInt(listenPort));
@@ -61,6 +71,7 @@ public record MqttOptions(
         defaultTenant,
         defaultNamespace,
         mqttTopicNameConverter,
-        coordinatorEnabled);
+        coordinatorEnabled,
+        duplicatedClientIdPolicy);
   }
 }
