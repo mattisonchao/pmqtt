@@ -11,7 +11,8 @@ public record MqttOptions(
     boolean authorizationEnabled,
     @NotNull String defaultTenant,
     @NotNull String defaultNamespace,
-    @NotNull String mqttTopicNameConverter) {
+    @NotNull String mqttTopicNameConverter,
+    boolean coordinatorEnabled) {
 
   // ----- converter
   private static final String MQTT_TOPIC_NAME_CONVERTER = "mqttTopicNameConverter";
@@ -23,6 +24,9 @@ public record MqttOptions(
   // ----- authentication
   private static final String MQTT_AUTHENTICATION_ENABLED = "false";
   private static final String MQTT_AUTHORIZATION_ENABLED = "false";
+
+  // ----- coordinator
+  private static final String MQTT_COORDINATOR_ENABLED = "mqttCoordinatorEnabled";
 
   public static @NotNull MqttOptions parse(@NotNull ServiceConfiguration brokerConfiguration) {
     final Properties properties =
@@ -45,6 +49,9 @@ public record MqttOptions(
                 MQTT_TOPIC_NAME_CONVERTER,
                 "io.github.pmqtt.broker.handler.converter.URLEncodeTopicNameConverter");
 
+    final boolean coordinatorEnabled =
+        Boolean.parseBoolean((String) properties.getOrDefault(MQTT_COORDINATOR_ENABLED, "false"));
+
     final InetSocketAddress socketAddress =
         new InetSocketAddress(listenAddress, Integer.parseInt(listenPort));
     return new MqttOptions(
@@ -53,6 +60,7 @@ public record MqttOptions(
         authorizationEnabled,
         defaultTenant,
         defaultNamespace,
-        mqttTopicNameConverter);
+        mqttTopicNameConverter,
+        coordinatorEnabled);
   }
 }

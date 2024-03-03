@@ -29,6 +29,8 @@ public abstract class AbstractPulsarCluster implements AutoCloseable {
   protected PulsarService broker1;
   protected PulsarService broker2;
 
+  private boolean enableMqttCoordinator = false;
+
   @SneakyThrows
   protected void start() {
     ensemble = new LocalBookkeeperEnsemble(3, 0, () -> 0);
@@ -42,7 +44,11 @@ public abstract class AbstractPulsarCluster implements AutoCloseable {
     broker2.start();
   }
 
-  protected void loadBrokerConfiguration(ServiceConfiguration brokerConf) {
+  protected void enableMqttCoordinator() {
+    enableMqttCoordinator = true;
+  }
+
+  private void loadBrokerConfiguration(ServiceConfiguration brokerConf) {
     final String projectRootPath =
         System.getProperty("user.dir").replace(File.separator + "pmqtt-integration", "");
     final String narDir =
@@ -66,12 +72,25 @@ public abstract class AbstractPulsarCluster implements AutoCloseable {
     brokerConf.setMessagingProtocols(Set.of("mqtt"));
     final Properties properties = new Properties();
     properties.put("mqttListenPort", String.valueOf(SocketUtils.findAvailableTcpPort()));
+    if (enableMqttCoordinator) {
+      properties.put("mqttCoordinatorEnabled", "true");
+    }
     brokerConf.setProperties(properties);
   }
 
   protected Pair<String, Integer> getMqttHostAndPort() {
     return Pair.of(
         "localhost", Integer.parseInt((String) broker1Conf.getProperty("mqttListenPort")));
+  }
+
+  protected Pair<String, Integer> getBroker1MqttHostAndPort() {
+    return Pair.of(
+        "localhost", Integer.parseInt((String) broker1Conf.getProperty("mqttListenPort")));
+  }
+
+  protected Pair<String, Integer> getBroker2MqttHostAndPort() {
+    return Pair.of(
+        "localhost", Integer.parseInt((String) broker2Conf.getProperty("mqttListenPort")));
   }
 
   @SneakyThrows

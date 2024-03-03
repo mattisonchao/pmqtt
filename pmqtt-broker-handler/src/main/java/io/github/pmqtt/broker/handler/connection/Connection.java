@@ -16,6 +16,7 @@ import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import io.github.pmqtt.broker.handler.MqttContext;
 import io.github.pmqtt.broker.handler.converter.TopicNameConverter;
+import io.github.pmqtt.broker.handler.exceptions.ClientIdConflictException;
 import io.github.pmqtt.broker.handler.exceptions.UnConnectedException;
 import io.github.pmqtt.broker.handler.exceptions.UnauthorizedException;
 import io.netty.buffer.ByteBuf;
@@ -71,6 +72,8 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import javax.annotation.Nonnull;
 import javax.validation.constraints.NotNull;
 import lombok.ToString;
@@ -119,6 +122,8 @@ import org.roaringbitmap.RoaringBitmap;
 @Slf4j
 public class Connection extends ChannelInboundHandlerAdapter
     implements TransportCnx, PulsarCommandSender {
+
+  private final String connectionId = UUID.randomUUID().toString();
 
   private final MqttContext mqttContext;
 
@@ -346,6 +351,9 @@ public class Connection extends ChannelInboundHandlerAdapter
 
   private String subject;
 
+  private final AtomicReference<Supplier<CompletableFuture<Void>>> releaseFuncRefer =
+      new AtomicReference<>();
+
   private void handleConnect(@Nonnull MqttConnectMessage connectMessage) {
     final MqttConnectVariableHeader var = connectMessage.variableHeader();
     final MqttConnectPayload payload = connectMessage.payload();
@@ -458,8 +466,22 @@ public class Connection extends ChannelInboundHandlerAdapter
         .thenCompose(
             subject -> {
               this.subject = subject;
-              return wrap(ctx.writeAndFlush(message));
+              final var coordinator = mqttContext.getCoordinator();
+              return coordinator
+                  .tryAcquireAsync(
+                      connectionId,
+                      clientId,
+                      (unused, err) ->
+                          closeAsync(CONNECTION_REFUSED_CLIENT_IDENTIFIER_NOT_VALID.byteValue()),
+                      releaseFuncRefer::set)
+                  .thenAccept(
+                      isAcquired -> {
+                        if (!isAcquired) {
+                          throw new ClientIdConflictException(clientId);
+                        }
+                      });
             })
+        .thenCompose(__ -> wrap(ctx.writeAndFlush(message)))
         .thenAccept(
             __ -> {
               log.info(
@@ -469,6 +491,19 @@ public class Connection extends ChannelInboundHandlerAdapter
             })
         .exceptionally(
             ex -> {
+              final Throwable rc = FutureUtil.unwrapCompletionException(ex);
+              if (rc instanceof ClientIdConflictException) {
+                final MqttConnectReturnCode returnCode =
+                    version.protocolLevel() < MqttVersion.MQTT_5.protocolLevel()
+                        ? CONNECTION_REFUSED_IDENTIFIER_REJECTED
+                        : CONNECTION_REFUSED_CLIENT_IDENTIFIER_NOT_VALID;
+                // todo: not sure if we need other properties
+                final MqttConnAckMessage rejectMessage =
+                    MqttMessageBuilders.connAck().returnCode(returnCode).build();
+                ctx.writeAndFlush(rejectMessage);
+                closeAsync(CONNECTION_REFUSED_CLIENT_IDENTIFIER_NOT_VALID.byteValue());
+                return null;
+              }
               log.error(
                   "Receive an error while accepting connection.  connection={}",
                   this,
@@ -1033,6 +1068,21 @@ public class Connection extends ChannelInboundHandlerAdapter
                   "Closed the connection. client_id={} client_address={}",
                   clientId,
                   clientAddress());
+
+              // the current client lifecycle has been stopped, we don't need care about the current
+              // coordinator resource releasing result. because we also do not have any way to
+              // notify
+              // the client side.
+              // So, the current behaviour will block this client id in the coordinator if we've met
+              // any
+              // unexpected exceptions.
+
+              // todo: handle unexpected exception
+              // todo: add a task retry mechanism...
+              var releaseFunc = releaseFuncRefer.get();
+              if (releaseFunc != null) {
+                releaseFunc.get(); // call release func
+              }
             })
         .exceptionally(
             ex -> {
@@ -1046,8 +1096,6 @@ public class Connection extends ChannelInboundHandlerAdapter
   }
 
   // ---------- command sender
-  private Map<Long, CompletableFuture<?>> requestFutures = new TreeMap<>();
-
   @Override
   public void sendSuccessResponse(long requestId) {}
 
