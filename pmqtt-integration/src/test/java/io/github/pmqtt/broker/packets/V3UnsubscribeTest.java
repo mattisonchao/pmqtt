@@ -69,4 +69,9 @@ public class V3UnsubscribeTest extends AbstractPulsarCluster {
 
     mqtt3BlockingClient.disconnect();
   }
+
+  @Test
+  public void testUnsubThenSubWithCleanSession() {
+    // todo: add test
+  }
 }
