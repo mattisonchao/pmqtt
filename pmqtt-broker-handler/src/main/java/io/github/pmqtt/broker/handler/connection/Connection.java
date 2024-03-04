@@ -10,6 +10,8 @@ import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUS
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_UNACCEPTABLE_PROTOCOL_VERSION;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_UNSPECIFIED_ERROR;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_UNSUPPORTED_PROTOCOL_VERSION;
+import static java.util.concurrent.CompletableFuture.completedFuture;
+import static java.util.concurrent.CompletableFuture.supplyAsync;
 import static org.apache.pulsar.common.util.FutureUtil.wrapToCompletionException;
 
 import com.google.common.base.Strings;
@@ -70,6 +72,7 @@ import java.util.UUID;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReference;
@@ -81,6 +84,7 @@ import lombok.ToString;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.bookkeeper.mledger.Entry;
 import org.apache.bookkeeper.mledger.Position;
+import org.apache.bookkeeper.mledger.impl.PositionImpl;
 import org.apache.pulsar.broker.authentication.AuthenticationDataCommand;
 import org.apache.pulsar.broker.authentication.AuthenticationDataSource;
 import org.apache.pulsar.broker.authentication.AuthenticationProvider;
@@ -257,7 +261,7 @@ public class Connection extends ChannelInboundHandlerAdapter
   @Override
   public CompletableFuture<Boolean> checkConnectionLiveness() {
     // we don't need support this
-    return CompletableFuture.completedFuture(true);
+    return completedFuture(true);
   }
 
   //  -------- channel section
@@ -440,8 +444,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                       .retainAvailable(false)
                       .subscriptionIdentifiersAvailable(false);
                 })
-            .sessionPresent(
-                !cleanSession) // todo session present, it should be subscription in pulsar
+            .sessionPresent(!cleanSession)
             .build();
     if (!STATUS_UPDATER.compareAndSet(this, STATUS_INIT, STATUS_ACCEPTED)) {
       // unexpected behaviour
@@ -462,7 +465,7 @@ public class Connection extends ChannelInboundHandlerAdapter
     if (mqttContext.getMqttOptions().authenticationEnabled()) {
       authFuture = doAuthenticate(connectMessage);
     } else {
-      authFuture = CompletableFuture.completedFuture(null);
+      authFuture = completedFuture(null);
     }
     authFuture
         .thenCompose(
@@ -608,7 +611,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                 .allowTopicOperationAsync(
                     pulsarTopicName, TopicOperation.PRODUCE, null, subject, null);
       } else {
-        authFuture = CompletableFuture.completedFuture(true);
+        authFuture = completedFuture(true);
       }
       producerFuture =
           authFuture
@@ -792,6 +795,8 @@ public class Connection extends ChannelInboundHandlerAdapter
   private static final KeySharedMeta EMPTY_KEY_SHARED_METADATA =
       new KeySharedMeta().setKeySharedMode(KeySharedMode.AUTO_SPLIT);
 
+  private final Map<String, TopicName> cleanedSubscription = new ConcurrentHashMap<>();
+
   private void handleSubscribe(@Nonnull MqttSubscribeMessage subscribeMessage) {
     final var var = subscribeMessage.idAndPropertiesVariableHeader();
     final var payload = subscribeMessage.payload();
@@ -815,7 +820,7 @@ public class Connection extends ChannelInboundHandlerAdapter
               .allowTopicOperationAsync(
                   pulsarTopicName, TopicOperation.SUBSCRIBE, null, subject, null);
     } else {
-      authFuture = CompletableFuture.completedFuture(true);
+      authFuture = completedFuture(true);
     }
     if (consumerFuture != null) {
       log.warn(
@@ -871,7 +876,22 @@ public class Connection extends ChannelInboundHandlerAdapter
                                 throw new IllegalStateException("");
                               }
                             })
-                        .thenCompose(__ -> subWithParameter.apply(topic)));
+                        .thenCompose(
+                            __ ->
+                                topic.createSubscription(
+                                    clientId,
+                                    CommandSubscribe.InitialPosition.Latest,
+                                    false,
+                                    Collections.emptyMap()))
+                        .thenCompose(
+                            sub -> {
+                              // reset position first
+                              if (cleanSession && sub.getConsumers().isEmpty()) {
+                                return sub.resetCursor(PositionImpl.LATEST)
+                                    .thenCompose(__ -> subWithParameter.apply(topic));
+                              }
+                              return subWithParameter.apply(topic);
+                            }));
     consumerFuture
         .thenCompose(
             consumer -> {
@@ -939,7 +959,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                 }
               });
     } else {
-      future = CompletableFuture.completedFuture(null);
+      future = completedFuture(null);
     }
     future
         .thenAcceptAsync(
@@ -1054,16 +1074,67 @@ public class Connection extends ChannelInboundHandlerAdapter
     }
     // DCL end
     log.info("Closing the connection. client_id={} client_address={}", clientId, clientAddress());
-    final CompletableFuture<Void> disconnectMessageFuture;
-    if (reasonCode != CLOSE_NO_REASON
-        && version.protocolLevel() > MqttVersion.MQTT_5.protocolLevel()) {
-      final MqttMessage disconnectMessage =
-          MqttMessageBuilders.disconnect().reasonCode(reasonCode).build();
-      disconnectMessageFuture = wrap(ctx.writeAndFlush(disconnectMessage));
-    } else {
-      disconnectMessageFuture = CompletableFuture.completedFuture(null);
-    }
-    disconnectMessageFuture
+
+    final CompletableFuture<Void> statefulResourcesCleanupFuture =
+        supplyAsync(
+                () -> {
+                  final List<CompletableFuture<Void>> cleanupFutures = new ArrayList<>();
+                  if (consumerFuture != null) {
+                    final CompletableFuture<Void> consumerCleanupFuture =
+                        consumerFuture
+                            .thenAccept(
+                                consumer -> {
+                                  try {
+                                    consumer.close();
+                                  } catch (BrokerServiceException ex) {
+                                    log.warn(
+                                        "Receive an error when cleanup the broker consumer resource."
+                                            + " please let admin clean it manually. consumer={}",
+                                        consumer,
+                                        ex);
+                                  }
+                                })
+                            .exceptionally(ex -> null); // we do not care about exceptional
+                    cleanupFutures.add(consumerCleanupFuture);
+                  }
+                  if (producerFuture != null) {
+                    final CompletableFuture<Void> producerCleanupFuture =
+                        producerFuture
+                            .thenCompose(
+                                producer ->
+                                    producer
+                                        .close(true)
+                                        .exceptionally(
+                                            ex -> {
+                                              final Throwable rc =
+                                                  FutureUtil.unwrapCompletionException(ex);
+                                              log.warn(
+                                                  "Receive an error when cleanup the broker producer resource."
+                                                      + " please let admin clean it manually. producer={}",
+                                                  producer,
+                                                  rc);
+                                              return null;
+                                            }))
+                            .exceptionally(ex -> null); // we do not care about exceptional
+                    cleanupFutures.add(producerCleanupFuture);
+                  }
+                  return cleanupFutures;
+                },
+                this::execute) // single thread to protect producer future
+            .thenCompose(FutureUtil::waitForAll);
+
+    statefulResourcesCleanupFuture
+        .thenCompose(
+            __ -> {
+              if (reasonCode != CLOSE_NO_REASON
+                  && version.protocolLevel() > MqttVersion.MQTT_5.protocolLevel()) {
+                final MqttMessage disconnectMessage =
+                    MqttMessageBuilders.disconnect().reasonCode(reasonCode).build();
+                return wrap(ctx.writeAndFlush(disconnectMessage));
+              } else {
+                return completedFuture(null);
+              }
+            })
         .thenCompose(__ -> wrap(ctx.close()))
         .thenAccept(
             __ -> {
@@ -1221,20 +1292,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                         "Get empty consumer when ack qos 0 messages, it should be a bug here.");
                   }
                 } else {
-                  // redeliver all the messages
-                  final List<MessageIdData> messageIdDataList = new ArrayList<>();
-                  int totalRedeliveredMessageNum = 0;
-                  for (int i = 0; i < entries.size(); i++) {
-                    totalRedeliveredMessageNum += batchSizes.getBatchSize(i);
-                    final Entry entry = entries.get(i);
-                    final MessageIdData messageIdData = new MessageIdData();
-                    messageIdData.setLedgerId(entry.getLedgerId());
-                    messageIdData.setEntryId(entry.getEntryId());
-                    messageIdDataList.add(messageIdData);
-                  }
-                  consumer.redeliverUnacknowledgedMessages(messageIdDataList);
-                  consumer.flowPermits(totalRedeliveredMessageNum);
-
+                  // in this case, the consumer should be removed.
                   if (log.isDebugEnabled()) {
                     log.debug(
                         "Receive an error while writing the message to client. client_address={} topic_name={}",
