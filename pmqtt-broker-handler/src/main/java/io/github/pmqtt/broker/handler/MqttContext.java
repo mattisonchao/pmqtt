@@ -6,6 +6,8 @@ import io.github.pmqtt.broker.handler.converter.TopicNameConverterFactory;
 import io.github.pmqtt.broker.handler.coordinator.CoordinatorDisable;
 import io.github.pmqtt.broker.handler.coordinator.CoordinatorFactory;
 import io.github.pmqtt.broker.handler.coordinator.DistributedResourcesCoordinator;
+import io.github.pmqtt.broker.handler.exchanger.MessageExchanger;
+import io.github.pmqtt.broker.handler.exchanger.MessageExchangerFactory;
 import io.github.pmqtt.broker.handler.options.MqttOptions;
 import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
@@ -29,6 +31,7 @@ public final class MqttContext extends ChannelInitializer<SocketChannel> {
   @Getter private final MqttOptions mqttOptions;
   @Getter private final TopicNameConverter converter;
   @Getter private final DistributedResourcesCoordinator coordinator;
+  @Getter private final MessageExchanger messageExchanger;
 
   public MqttContext(@NotNull PulsarService pulsarService, @NotNull MqttOptions mqttOptions)
       throws ClassNotFoundException {
@@ -44,6 +47,7 @@ public final class MqttContext extends ChannelInitializer<SocketChannel> {
             ? CoordinatorFactory.createMetadata(
                 pulsarService, mqttOptions.duplicatedClientIdPolicy())
             : CoordinatorDisable.INSTANCE;
+    this.messageExchanger = MessageExchangerFactory.createPulsarInternal(this);
   }
 
   @Override

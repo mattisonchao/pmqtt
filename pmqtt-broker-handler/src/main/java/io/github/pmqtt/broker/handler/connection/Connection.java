@@ -21,6 +21,7 @@ import io.github.pmqtt.broker.handler.converter.TopicNameConverter;
 import io.github.pmqtt.broker.handler.exceptions.ClientIdConflictException;
 import io.github.pmqtt.broker.handler.exceptions.UnConnectedException;
 import io.github.pmqtt.broker.handler.exceptions.UnauthorizedException;
+import io.github.pmqtt.broker.handler.exchanger.MessageExchanger;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelDuplexHandler;
@@ -1156,6 +1157,24 @@ public class Connection extends ChannelInboundHandlerAdapter
               var releaseFunc = releaseFuncRefer.get();
               if (releaseFunc != null) {
                 releaseFunc.get(); // call release func
+              }
+
+              // will message
+              if (willFlag) {
+                final MessageExchanger messageExchanger = mqttContext.getMessageExchanger();
+                messageExchanger
+                    .exchangeMqttMessage(
+                        willTopic, willQos, willMessage, willRetained, willProperties)
+                    .exceptionally(
+                        ex -> {
+                          final Throwable rc = FutureUtil.unwrapCompletionException(ex);
+                          log.error(
+                              "Receive an error when publish will message. connection={} will_topic={}",
+                              this,
+                              willTopic,
+                              rc);
+                          return null;
+                        });
               }
             })
         .exceptionally(
