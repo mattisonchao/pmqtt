@@ -73,6 +73,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import javax.annotation.Nonnull;
 import javax.validation.constraints.NotNull;
@@ -94,6 +95,7 @@ import org.apache.pulsar.broker.service.PulsarCommandSender;
 import org.apache.pulsar.broker.service.RedeliveryTracker;
 import org.apache.pulsar.broker.service.Subscription;
 import org.apache.pulsar.broker.service.SubscriptionOption;
+import org.apache.pulsar.broker.service.Topic;
 import org.apache.pulsar.broker.service.TransportCnx;
 import org.apache.pulsar.client.api.CompressionType;
 import org.apache.pulsar.client.api.MessageId;
@@ -823,6 +825,29 @@ public class Connection extends ChannelInboundHandlerAdapter
           clientId);
       return;
     }
+    final Function<Topic, CompletableFuture<Consumer>> subWithParameter =
+        (topic) -> {
+          final SubscriptionOption option =
+              SubscriptionOption.builder()
+                  .cnx(this)
+                  .subscriptionName(subscriptionName)
+                  .consumerId(CONSUMER_ID)
+                  .subType(CommandSubscribe.SubType.Shared)
+                  .priorityLevel(PRIORITY_LEVEL)
+                  .consumerName(consumerName)
+                  .isDurable(true)
+                  .startMessageId(MessageId.latest)
+                  .metadata(Collections.emptyMap())
+                  .readCompacted(false)
+                  .initialPosition(CommandSubscribe.InitialPosition.Latest)
+                  .startMessageRollbackDurationSec(-1)
+                  .replicatedSubscriptionStateArg(false)
+                  .keySharedMeta(EMPTY_KEY_SHARED_METADATA)
+                  .subscriptionProperties(Optional.empty())
+                  .consumerEpoch(CONSUMER_EPOCH)
+                  .build();
+          return topic.subscribe(option);
+        };
     consumerFuture =
         authFuture
             .thenCompose(
@@ -846,29 +871,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                                 throw new IllegalStateException("");
                               }
                             })
-                        .thenCompose(
-                            __ -> {
-                              final SubscriptionOption option =
-                                  SubscriptionOption.builder()
-                                      .cnx(this)
-                                      .subscriptionName(subscriptionName)
-                                      .consumerId(CONSUMER_ID)
-                                      .subType(CommandSubscribe.SubType.Shared)
-                                      .priorityLevel(PRIORITY_LEVEL)
-                                      .consumerName(consumerName)
-                                      .isDurable(true)
-                                      .startMessageId(MessageId.latest)
-                                      .metadata(Collections.emptyMap())
-                                      .readCompacted(false)
-                                      .initialPosition(CommandSubscribe.InitialPosition.Latest)
-                                      .startMessageRollbackDurationSec(-1)
-                                      .replicatedSubscriptionStateArg(false)
-                                      .keySharedMeta(EMPTY_KEY_SHARED_METADATA)
-                                      .subscriptionProperties(Optional.empty())
-                                      .consumerEpoch(CONSUMER_EPOCH)
-                                      .build();
-                              return topic.subscribe(option);
-                            }));
+                        .thenCompose(__ -> subWithParameter.apply(topic)));
     consumerFuture
         .thenCompose(
             consumer -> {
@@ -1219,15 +1222,26 @@ public class Connection extends ChannelInboundHandlerAdapter
                   }
                 } else {
                   // redeliver all the messages
-                  entries.forEach(
-                      entry ->
-                          redeliveryTracker.incrementAndGetRedeliveryCount(entry.getPosition()));
+                  final List<MessageIdData> messageIdDataList = new ArrayList<>();
+                  int totalRedeliveredMessageNum = 0;
+                  for (int i = 0; i < entries.size(); i++) {
+                    totalRedeliveredMessageNum += batchSizes.getBatchSize(i);
+                    final Entry entry = entries.get(i);
+                    final MessageIdData messageIdData = new MessageIdData();
+                    messageIdData.setLedgerId(entry.getLedgerId());
+                    messageIdData.setEntryId(entry.getEntryId());
+                    messageIdDataList.add(messageIdData);
+                  }
+                  consumer.redeliverUnacknowledgedMessages(messageIdDataList);
+                  consumer.flowPermits(totalRedeliveredMessageNum);
 
-                  log.error(
-                      "Receive an error while writing the message to client. client_address={} topic_name={}",
-                      clientSourceAddress(),
-                      pulsarTopicNameStr,
-                      future.cause());
+                  if (log.isDebugEnabled()) {
+                    log.debug(
+                        "Receive an error while writing the message to client. client_address={} topic_name={}",
+                        clientSourceAddress(),
+                        pulsarTopicNameStr,
+                        future.cause());
+                  }
                 }
 
                 // release the entries only after flushing the channel

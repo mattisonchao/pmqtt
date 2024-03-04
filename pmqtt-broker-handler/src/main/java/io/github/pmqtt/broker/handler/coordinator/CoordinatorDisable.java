@@ -19,6 +19,6 @@ public final class CoordinatorDisable implements DistributedResourcesCoordinator
     if (releaseFunc != null) {
       releaseFunc.accept(() -> CompletableFuture.completedFuture(null));
     }
-    return CompletableFuture.completedFuture(null);
+    return CompletableFuture.completedFuture(true);
   }
 }

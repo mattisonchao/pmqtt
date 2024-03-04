@@ -14,6 +14,8 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.UUID;
+import javax.annotation.Nullable;
+import javax.validation.constraints.NotNull;
 import lombok.SneakyThrows;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.pulsar.broker.PulsarService;
@@ -106,11 +108,22 @@ public abstract class AbstractPulsarCluster implements AutoCloseable {
     ensemble.stop();
   }
 
-  protected Mqtt3BlockingClient createAutoLookupClient(String mqttTopicName) {
+  protected Mqtt3BlockingClient createAutoLookupClient(@NotNull String mqttTopicName) {
+    return createAutoLookupClient(mqttTopicName, null);
+  }
+
+  protected Mqtt3BlockingClient createAutoLookupClient(
+      @NotNull String mqttTopicName, @Nullable String clientId) {
     final Pair<String, Integer> hostAndPort = getMqttHostAndPort();
+    final String clientIdentifier;
+    if (clientId == null) {
+      clientIdentifier = UUID.randomUUID().toString();
+    } else {
+      clientIdentifier = clientId;
+    }
     return MqttClient.builder()
         .useMqttVersion3()
-        .identifier(UUID.randomUUID().toString())
+        .identifier(clientIdentifier)
         .serverHost(hostAndPort.getLeft())
         .serverPort(hostAndPort.getRight())
         .automaticReconnectWithDefaultConfig()
