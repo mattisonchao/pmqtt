@@ -1,5 +1,6 @@
 package io.github.pmqtt.broker.handler.connection;
 
+import static io.github.pmqtt.broker.handler.env.Constants.RETAINED_MESSAGE_KEY;
 import static io.github.pmqtt.broker.handler.utils.future.CompletableFutures.wrap;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_ACCEPTED;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_CLIENT_IDENTIFIER_NOT_VALID;
@@ -14,6 +15,7 @@ import static java.util.concurrent.CompletableFuture.completedFuture;
 import static java.util.concurrent.CompletableFuture.supplyAsync;
 import static org.apache.pulsar.common.util.FutureUtil.wrapToCompletionException;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.google.common.base.Strings;
 import com.google.common.base.Throwables;
 import io.github.pmqtt.broker.handler.MqttContext;
@@ -83,7 +85,10 @@ import javax.annotation.Nonnull;
 import javax.validation.constraints.NotNull;
 import lombok.ToString;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.bookkeeper.mledger.AsyncCallbacks;
 import org.apache.bookkeeper.mledger.Entry;
+import org.apache.bookkeeper.mledger.ManagedLedger;
+import org.apache.bookkeeper.mledger.ManagedLedgerException;
 import org.apache.bookkeeper.mledger.Position;
 import org.apache.bookkeeper.mledger.impl.PositionImpl;
 import org.apache.pulsar.broker.authentication.AuthenticationDataCommand;
@@ -102,6 +107,7 @@ import org.apache.pulsar.broker.service.Subscription;
 import org.apache.pulsar.broker.service.SubscriptionOption;
 import org.apache.pulsar.broker.service.Topic;
 import org.apache.pulsar.broker.service.TransportCnx;
+import org.apache.pulsar.broker.service.persistent.PersistentTopic;
 import org.apache.pulsar.client.api.CompressionType;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.transaction.TxnID;
@@ -123,6 +129,7 @@ import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.protocol.schema.SchemaVersion;
 import org.apache.pulsar.common.schema.SchemaInfo;
 import org.apache.pulsar.common.util.FutureUtil;
+import org.apache.pulsar.common.util.ObjectMapperFactory;
 import org.roaringbitmap.RoaringBitmap;
 
 @ToString
@@ -643,10 +650,17 @@ public class Connection extends ChannelInboundHandlerAdapter
                             false);
                     return topic
                         .addProducer(producer, new CompletableFuture<>())
-                        .thenApply(topicEpoch -> producer);
+                        .thenApply(unused -> producer);
                   });
     }
     producerFuture // todo: we should give a pending limit here.
+        .thenCompose(
+            producer -> {
+              final Topic topic = producer.getTopic();
+              return setRetainedMessage(topic, message)
+                  // ^^ this method will not throw the exception
+                  .thenApply(__ -> producer);
+            })
         .thenAccept(
             producer -> {
               if (!Objects.equals(pulsarTopicName.toString(), producer.getTopic().getName())) {
@@ -684,6 +698,64 @@ public class Connection extends ChannelInboundHandlerAdapter
               closeAsync(CONNECTION_REFUSED_UNSPECIFIED_ERROR.byteValue());
               return null;
             });
+  }
+
+  private static @NotNull CompletableFuture<Void> setRetainedMessage(
+      @NotNull Topic topic, @NotNull MqttPublishMessage message) {
+    final var fix = message.fixedHeader();
+    final var var = message.variableHeader();
+    final String mqttTopicName = var.topicName();
+
+    if (!fix.isRetain() || !topic.isPersistent()) {
+      return CompletableFuture.completedFuture(null);
+    }
+    final ManagedLedger managedLedger = ((PersistentTopic) topic).getManagedLedger();
+    final ByteBuf payload = message.payload();
+    final byte[] bPayload = new byte[payload.readableBytes()];
+    payload.markReaderIndex();
+    payload.readBytes(bPayload);
+    payload.resetReaderIndex();
+    final RawMessage rawMessage = new RawMessage(bPayload);
+    final String sRawMessage;
+    try {
+      sRawMessage =
+          ObjectMapperFactory.getMapper().getObjectMapper().writeValueAsString(rawMessage);
+    } catch (JsonProcessingException ex) {
+      log.warn(
+          "Receive an exception when serialize retained data, ignore the retain setting."
+              + " packet_id={} mqtt_topic={}",
+          var.packetId(),
+          mqttTopicName,
+          ex);
+      return CompletableFuture.completedFuture(null);
+    }
+    final CompletableFuture<Void> future = new CompletableFuture<>();
+    managedLedger.asyncSetProperty(
+        RETAINED_MESSAGE_KEY,
+        sRawMessage,
+        new AsyncCallbacks.UpdatePropertiesCallback() {
+          @Override
+          public void updatePropertiesComplete(Map<String, String> properties, Object ctx) {
+            future.complete(null);
+          }
+
+          @Override
+          public void updatePropertiesFailed(ManagedLedgerException exception, Object ctx) {
+            future.completeExceptionally(exception);
+          }
+        },
+        null);
+    return future.exceptionally(
+        ex -> { // do not expose exception outside
+          final Throwable rc = FutureUtil.unwrapCompletionException(ex);
+          log.warn(
+              "Receive an exception when updating topic properties,"
+                  + " ignore the retain setting. packet_id={} mqtt_topic={}",
+              var.packetId(),
+              mqttTopicName,
+              rc);
+          return null;
+        });
   }
 
   private static final FastThreadLocal<MessageMetadata> LOCAL_MESSAGE_METADATA =
@@ -798,6 +870,8 @@ public class Connection extends ChannelInboundHandlerAdapter
 
   private final Map<String, TopicName> cleanedSubscription = new ConcurrentHashMap<>();
 
+  private boolean allowDispatchRetained;
+
   private void handleSubscribe(@Nonnull MqttSubscribeMessage subscribeMessage) {
     final var var = subscribeMessage.idAndPropertiesVariableHeader();
     final var payload = subscribeMessage.payload();
@@ -902,7 +976,32 @@ public class Connection extends ChannelInboundHandlerAdapter
                       .addGrantedQos(consumerQos)
                       .build();
               return wrap(ctx.writeAndFlush(message))
-                  .thenAccept(__ -> consumer.flowPermits(PERMITS_TOTAL));
+                  .thenAcceptAsync(
+                      __ -> {
+                        // there is IO thead, we don't need concurrent control here.
+                        allowDispatchRetained = true;
+                        final Subscription sub = consumer.getSubscription();
+                        final Topic topic = sub.getTopic();
+                        if (!hasRetainedMessage(topic)) {
+                          return;
+                        }
+                        final EntryBatchSizes entryBatchSizes = EntryBatchSizes.get(0);
+                        final EntryBatchIndexesAcks entryBatchIndexesAcks =
+                            EntryBatchIndexesAcks.get(0);
+                        // trigger the dispatching to dispatch retained message
+                        sendMessagesToConsumer(
+                            CONSUMER_ID,
+                            pulsarTopicName.toString(),
+                            sub,
+                            -1,
+                            Collections.emptyList(),
+                            entryBatchSizes,
+                            entryBatchIndexesAcks,
+                            null,
+                            CONSUMER_EPOCH);
+                        consumer.flowPermits(PERMITS_TOTAL);
+                      },
+                      this::execute);
             })
         .thenAccept(
             __ -> {
@@ -940,6 +1039,19 @@ public class Connection extends ChannelInboundHandlerAdapter
             });
   }
 
+  private static boolean hasRetainedMessage(@NotNull Topic topic) {
+    if (!topic.isPersistent()) {
+      return false;
+    }
+    final ManagedLedger managedLedger = ((PersistentTopic) topic).getManagedLedger();
+    final Map<String, String> properties = managedLedger.getProperties();
+    if (properties == null) {
+      return false;
+    }
+    final String retainedMessage = properties.get(RETAINED_MESSAGE_KEY);
+    return retainedMessage != null;
+  }
+
   private void handleUnsubscribe(MqttUnsubscribeMessage msg) {
     final var var = msg.idAndPropertiesVariableHeader();
     final int packetId = var.messageId();
@@ -969,6 +1081,8 @@ public class Connection extends ChannelInboundHandlerAdapter
               if (consumerFuture != null && consumerFuture == consumerFuturePointer) {
                 // reset consumer future then the client can sub to another topic
                 consumerFuture = null;
+                // reset consumer related resources
+                allowDispatchRetained = false;
               }
             },
             ctx.channel().eventLoop())
@@ -1216,43 +1330,83 @@ public class Connection extends ChannelInboundHandlerAdapter
       long epoch) {
     final TopicName pulsarTopicName = TopicName.get(pulsarTopicNameStr);
     final TopicNameConverter converter = mqttContext.getConverter();
+    final String mqttTopicName = converter.convert(pulsarTopicName);
     final ChannelPromise writePromise = ctx.newPromise();
     // single thread to avoid concurrent problem
     // protect `packetIdBitMap`,
+    // todo refactor retain logic
     execute(
         () -> {
           final Set<Integer> insufficientPacketIdEntryIndexes = new HashSet<>();
           final List<Entry> entriesToRelease = new ArrayList<>(entries.size());
-          final List<SemiFinishedPubMessage> mqttPublishMessages =
+          List<SemiFinishedPubMessage> mqttPublishMessages =
               makeSemiFinishedPublishMessages(entries, entriesToRelease, pulsarTopicNameStr);
+          final Topic topic = subscription.getTopic();
+          boolean retainedDispatched = false;
+          if (allowDispatchRetained && topic.isPersistent()) {
+            final List<SemiFinishedPubMessage> previousPointer = mqttPublishMessages;
+            mqttPublishMessages = new ArrayList<>(1 + mqttPublishMessages.size());
+            final ManagedLedger managedLedger = ((PersistentTopic) topic).getManagedLedger();
+            final Map<String, String> properties = managedLedger.getProperties();
+            final String jsonData = properties.get(RETAINED_MESSAGE_KEY);
+            if (jsonData != null) {
+              try {
+                final RawMessage rawMessage =
+                    ObjectMapperFactory.getMapper()
+                        .getObjectMapper()
+                        .readValue(jsonData, RawMessage.class);
+                final var retainedMessage =
+                    SemiFinishedPubMessage.builder()
+                        .noAck(true)
+                        .publishBuilder(
+                            MqttMessageBuilders.publish()
+                                .retained(true)
+                                .payload(Unpooled.wrappedBuffer(rawMessage.payload())))
+                        .build();
+                mqttPublishMessages.add(retainedMessage);
+                mqttPublishMessages.addAll(previousPointer);
+                retainedDispatched = true;
+              } catch (JsonProcessingException ex) {
+                log.warn(
+                    "Receive an exception when serialize retained data, ignore the retain dispatching."
+                        + " mqtt_topic={} pulsar_topic={}",
+                    mqttTopicName,
+                    pulsarTopicNameStr,
+                    ex);
+              }
+            }
+          }
+          final int messageNum = mqttPublishMessages.size();
           for (final SemiFinishedPubMessage semiFinishedPubMessage : mqttPublishMessages) {
             final var pubBuilder = semiFinishedPubMessage.getPublishBuilder();
-            final int entryIndex = semiFinishedPubMessage.getEntryIndex();
-            final Entry originalEntry = entries.get(entryIndex);
-            final int batchSize = batchSizes.getBatchSize(entryIndex);
             // packet id generation
-            final int packetId =
-                consumerQos == MqttQoS.AT_MOST_ONCE
-                    ? NO_ACK_PACKET_ID
-                    : (int) packetIdBitMap.nextAbsentValue(1);
-            if (packetId > MAX_PACKET_ID) {
-              insufficientPacketIdEntryIndexes.add(entryIndex);
-              continue;
+            final int packetId;
+            if (consumerQos == MqttQoS.AT_MOST_ONCE || semiFinishedPubMessage.isNoAck()) {
+              packetId = NO_ACK_PACKET_ID;
+            } else {
+              packetId = (int) packetIdBitMap.nextAbsentValue(1);
+              final int entryIndex = semiFinishedPubMessage.getEntryIndex();
+              final Entry originalEntry = entries.get(entryIndex);
+              final int batchSize = batchSizes.getBatchSize(entryIndex);
+              if (packetId > MAX_PACKET_ID) {
+                insufficientPacketIdEntryIndexes.add(entryIndex);
+                continue;
+              }
+              packetIdBitMap.add(packetId);
+              final var packetIdContextBuilder =
+                  PacketIdContext.builder()
+                      .ledgerId(originalEntry.getLedgerId())
+                      .entryId(originalEntry.getEntryId())
+                      .batchSize(batchSize)
+                      .batchIndex(semiFinishedPubMessage.getBatchIndex());
+              packetContexts.put(packetId, packetIdContextBuilder.build());
             }
-            packetIdBitMap.add(packetId);
-            final var packetIdContextBuilder =
-                PacketIdContext.builder()
-                    .ledgerId(originalEntry.getLedgerId())
-                    .entryId(originalEntry.getEntryId())
-                    .batchSize(batchSize)
-                    .batchIndex(semiFinishedPubMessage.getBatchIndex());
-            packetContexts.put(packetId, packetIdContextBuilder.build());
 
             final MqttPublishMessage message =
                 pubBuilder
                     .messageId(packetId)
-                    .qos(consumerQos)
-                    .topicName(converter.convert(pulsarTopicName))
+                    .qos(semiFinishedPubMessage.isNoAck() ? MqttQoS.AT_MOST_ONCE : consumerQos)
+                    .topicName(mqttTopicName)
                     .build();
             ctx.write(message, ctx.voidPromise());
           }
@@ -1260,11 +1414,16 @@ public class Connection extends ChannelInboundHandlerAdapter
           // Use an empty write here so that we can just tie the flush with the write promise for
           // the last entry.
           ctx.writeAndFlush(Unpooled.EMPTY_BUFFER, writePromise);
+          final boolean fRetainedDispatched = retainedDispatched;
           writePromise.addListener(
               (future) -> {
                 final Consumer consumer = consumerFuture.getNow(null);
                 if (future.isSuccess()) {
                   if (consumer != null) {
+                    if (fRetainedDispatched) {
+                      // it should set in IO thread
+                      allowDispatchRetained = false;
+                    }
                     // acknowledge qos0 messages because qos0 don't need ack
                     if (consumerQos == MqttQoS.AT_MOST_ONCE) {
                       final List<Position> needAckEntries =
@@ -1297,8 +1456,7 @@ public class Connection extends ChannelInboundHandlerAdapter
                       consumer.redeliverUnacknowledgedMessages(redeliverMessages);
                       consumer.flowPermits(totalRedeliveredMessageNum);
                     } else {
-                      int pendingFlowTotal =
-                          pendingFlowPermits.addAndGet(mqttPublishMessages.size());
+                      int pendingFlowTotal = pendingFlowPermits.addAndGet(messageNum);
                       if (pendingFlowTotal >= PERMITS_TOTAL / 2) {
                         if (pendingFlowPermits.compareAndSet(pendingFlowTotal, 0)) {
                           consumer.flowPermits(pendingFlowTotal);

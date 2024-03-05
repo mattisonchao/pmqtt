@@ -8,6 +8,7 @@ import lombok.Data;
 @Builder
 final class SemiFinishedPubMessage {
   private MqttMessageBuilders.PublishBuilder publishBuilder;
+  private boolean noAck;
   private int entryIndex;
   private int batchIndex;
 }
