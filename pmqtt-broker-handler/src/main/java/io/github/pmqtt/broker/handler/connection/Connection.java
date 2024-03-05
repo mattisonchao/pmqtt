@@ -468,6 +468,8 @@ public class Connection extends ChannelInboundHandlerAdapter
     this.willProperties = connectMessage.payload().willProperties();
     this.willQos = connectMessage.variableHeader().willQos();
     this.willFlag = connectMessage.variableHeader().isWillFlag();
+    // todo: support will retained
+    this.willRetained = connectMessage.variableHeader().isWillRetain();
 
     final CompletableFuture<String> authFuture;
     if (mqttContext.getMqttOptions().authenticationEnabled()) {
